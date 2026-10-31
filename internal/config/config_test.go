@@ -20,7 +20,7 @@ func TestFromEnvDefaults(t *testing.T) {
 	if cfg.NodeName != "node-a" || cfg.StoragePath != DefaultStoragePath || cfg.MetricsAddr != DefaultMetricsAddr {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
-	if cfg.ScanInterval != 5*time.Minute || cfg.ScanTimeout != 2*time.Minute || cfg.Parallelism != 2 {
+	if cfg.ScanInterval != 5*time.Minute || cfg.ScanTimeout != 2*time.Minute || cfg.Parallelism != 1 {
 		t.Fatalf("unexpected scan defaults: %+v", cfg)
 	}
 }
