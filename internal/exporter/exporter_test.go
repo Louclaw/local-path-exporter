@@ -21,7 +21,7 @@ func TestRunOnceTimeoutKeepsPrevious(t *testing.T) {
 		Sample:    metrics.Sample{Namespace: "ns", PVC: "data", UsedBytes: 23},
 	}}, 0)
 
-	vols := []mapping.Volume{{Path: "/pvc", Namespace: "ns", Name: "data", Capacity: 100}}
+	vols := []mapping.Volume{{Path: "/pvc", Namespace: "ns", Name: "data", PV: "pvc-1", Node: "node-a", Capacity: 100, CapacityFromPVC: true}}
 	RunOnce(context.Background(), vols, func(ctx context.Context, path string) (scan.Report, error) {
 		<-ctx.Done()
 		return scan.Report{}, ctx.Err()
@@ -69,10 +69,10 @@ func TestRunOnceParallelismAndMath(t *testing.T) {
 	}
 
 	vols := []mapping.Volume{
-		{Path: "/a", Namespace: "ns", Name: "a", Capacity: 100},
-		{Path: "/b", Namespace: "ns", Name: "b", Capacity: 100},
-		{Path: "/c", Namespace: "ns", Name: "c", Capacity: 30},
-		{Path: "/bad", Namespace: "ns", Name: "bad", Capacity: 100},
+		{Path: "/a", Namespace: "ns", Name: "a", PV: "pvc-a", Node: "node-a", Capacity: 100, CapacityFromPVC: true},
+		{Path: "/b", Namespace: "ns", Name: "b", PV: "pvc-b", Node: "node-a", Capacity: 100, CapacityFromPVC: true},
+		{Path: "/c", Namespace: "ns", Name: "c", PV: "pvc-c", Node: "node-a", Capacity: 30, CapacityFromPVC: true},
+		{Path: "/bad", Namespace: "ns", Name: "bad", PV: "pvc-bad", Node: "node-a", Capacity: 100, CapacityFromPVC: true},
 	}
 	cache := metrics.NewCache()
 	done := make(chan struct{})
@@ -98,7 +98,7 @@ func TestRunOnceParallelismAndMath(t *testing.T) {
 	for _, s := range snap.Samples {
 		byName[s.PVC] = s
 	}
-	if byName["a"].UsedBytes != 40 || byName["a"].AvailableBytes != 60 || byName["a"].InodesUsed != 3 {
+	if byName["a"].UsedBytes != 40 || byName["a"].AvailableBytes != 60 || byName["a"].InodesUsed != 3 || byName["a"].PV != "pvc-a" || byName["a"].Node != "node-a" {
 		t.Fatalf("a = %+v", byName["a"])
 	}
 	// used 40 > capacity 30, so available is 0 even though the filesystem has space.
@@ -110,6 +110,30 @@ func TestRunOnceParallelismAndMath(t *testing.T) {
 	}
 	if snap.Errors != 1 {
 		t.Fatalf("errors %v", snap.Errors)
+	}
+}
+
+func TestRunOnceFilesystemCapacity(t *testing.T) {
+	cache := metrics.NewCache()
+	vols := []mapping.Volume{{
+		Path: "/a", Namespace: "ns", Name: "data", PV: "pvc-fallback", Node: "node-a",
+	}}
+	RunOnce(context.Background(), vols, func(ctx context.Context, path string) (scan.Report, error) {
+		return scan.Report{
+			Usage:      scan.Usage{Bytes: 100, Inodes: 2},
+			TotalBytes: 8000,
+			AvailBytes: 7000,
+			Files:      10,
+			FilesFree:  8,
+		}, nil
+	}, cache, 1, time.Second, time.Now())
+	snap := cache.Snapshot()
+	if len(snap.Samples) != 1 {
+		t.Fatal(snap.Samples)
+	}
+	s := snap.Samples[0]
+	if !s.EmitCapacity || s.CapacityBytes != 8000 || s.AvailableBytes != 7000 || s.PV != "pvc-fallback" {
+		t.Fatalf("filesystem fallback: %+v", s)
 	}
 }
 

@@ -41,6 +41,41 @@ jobs:
           tags: local-path-exporter:ci
           labels: |
             org.opencontainers.image.source=https://github.com/Louclaw/local-path-exporter
+      - name: Smoke
+        run: |
+          set -euo pipefail
+          sa="$(mktemp -d)"
+          chmod 755 "${sa}"
+          printf 'smoke' > "${sa}/token"
+          printf 'smoke' > "${sa}/ca.crt"
+          printf 'default' > "${sa}/namespace"
+          chmod 644 "${sa}/token" "${sa}/ca.crt" "${sa}/namespace"
+          docker rm -f lpe-smoke >/dev/null 2>&1 || true
+          docker run -d --name lpe-smoke \
+            -e NODE_NAME=smoke \
+            -e KUBERNETES_SERVICE_HOST=127.0.0.1 \
+            -e KUBERNETES_SERVICE_PORT=1 \
+            -v "${sa}:/var/run/secrets/kubernetes.io/serviceaccount:ro" \
+            -p 9100:9100 \
+            local-path-exporter:ci
+          cleanup() { docker logs lpe-smoke >&2 || true; docker rm -f lpe-smoke >/dev/null || true; }
+          trap cleanup EXIT
+          ok=0
+          for _ in $(seq 1 50); do
+            if curl -sf http://127.0.0.1:9100/healthz >/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [[ "${ok}" != 1 ]]; then
+            echo "healthz did not respond" >&2
+            exit 1
+          fi
+          curl -sf http://127.0.0.1:9100/metrics | grep -q local_path_exporter_scan_errors_total
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9100/readyz)"
+          test "${code}" = "503"
+          test "$(docker inspect -f '{{.State.Running}}' lpe-smoke)" = "true"
 
   publish:
     name: publish
@@ -59,21 +94,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Image tags
-        id: tags
-        run: |
-          set -euo pipefail
-          image=ghcr.io/louclaw/local-path-exporter
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "tags=${image}:${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
-          else
-            {
-              echo "tags<<EOF"
-              echo "${image}:main"
-              echo "${image}:sha-${GITHUB_SHA::12}"
-              echo "EOF"
-            } >> "${GITHUB_OUTPUT}"
-          fi
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/louclaw/local-path-exporter
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch
+            type=sha
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -81,6 +114,5 @@ jobs:
           push: true
           provenance: false
           sbom: false
-          tags: ${{ steps.tags.outputs.tags }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/Louclaw/local-path-exporter
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

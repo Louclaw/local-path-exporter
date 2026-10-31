@@ -89,29 +89,29 @@ func TestCollectorSeries(t *testing.T) {
 	c.Commit([]Result{{
 		Namespace: "ns",
 		PVC:       "data",
-		Sample:    NewSample("ns", "data", 100, 40, 7, 1000, 50, 30, stats.AvailableBytes),
+		Sample:    NewSample("ns", "data", "pvc-1", "node-a", 100, 40, 7, 1000, 50, 30, true, stats.AvailableBytes),
 	}}, 1.25)
 
 	col := NewCollector(c)
 	expected := `
 # HELP kubelet_volume_stats_available_bytes Number of available bytes in the volume
 # TYPE kubelet_volume_stats_available_bytes gauge
-kubelet_volume_stats_available_bytes{namespace="ns",persistentvolumeclaim="data"} 60
+kubelet_volume_stats_available_bytes{namespace="ns",node="node-a",persistentvolume="pvc-1",persistentvolumeclaim="data"} 60
 # HELP kubelet_volume_stats_capacity_bytes Capacity in bytes of the volume
 # TYPE kubelet_volume_stats_capacity_bytes gauge
-kubelet_volume_stats_capacity_bytes{namespace="ns",persistentvolumeclaim="data"} 100
-# HELP kubelet_volume_stats_inodes Maximum number of inodes in the volume
+kubelet_volume_stats_capacity_bytes{namespace="ns",node="node-a",persistentvolume="pvc-1",persistentvolumeclaim="data"} 100
+# HELP kubelet_volume_stats_inodes Maximum number of inodes on the filesystem that hosts the volume. Shared by every volume on that filesystem.
 # TYPE kubelet_volume_stats_inodes gauge
-kubelet_volume_stats_inodes{namespace="ns",persistentvolumeclaim="data"} 50
-# HELP kubelet_volume_stats_inodes_free Number of free inodes in the volume
+kubelet_volume_stats_inodes{namespace="ns",node="node-a",persistentvolume="pvc-1",persistentvolumeclaim="data"} 50
+# HELP kubelet_volume_stats_inodes_free Free inodes on the filesystem that hosts the volume. Not a per-PVC quota.
 # TYPE kubelet_volume_stats_inodes_free gauge
-kubelet_volume_stats_inodes_free{namespace="ns",persistentvolumeclaim="data"} 30
+kubelet_volume_stats_inodes_free{namespace="ns",node="node-a",persistentvolume="pvc-1",persistentvolumeclaim="data"} 30
 # HELP kubelet_volume_stats_inodes_used Number of used inodes in the volume
 # TYPE kubelet_volume_stats_inodes_used gauge
-kubelet_volume_stats_inodes_used{namespace="ns",persistentvolumeclaim="data"} 7
+kubelet_volume_stats_inodes_used{namespace="ns",node="node-a",persistentvolume="pvc-1",persistentvolumeclaim="data"} 7
 # HELP kubelet_volume_stats_used_bytes Number of used bytes in the volume
 # TYPE kubelet_volume_stats_used_bytes gauge
-kubelet_volume_stats_used_bytes{namespace="ns",persistentvolumeclaim="data"} 40
+kubelet_volume_stats_used_bytes{namespace="ns",node="node-a",persistentvolume="pvc-1",persistentvolumeclaim="data"} 40
 # HELP local_path_exporter_scan_duration_seconds Duration of the last scan cycle in seconds.
 # TYPE local_path_exporter_scan_duration_seconds gauge
 local_path_exporter_scan_duration_seconds 1.25
@@ -138,6 +138,28 @@ local_path_exporter_scan_last_success_timestamp_seconds 100
 	for _, fam := range fams {
 		if strings.HasPrefix(fam.GetName(), "kubelet_volume_stats_") && len(fam.Metric) != 0 {
 			t.Fatalf("stale series still exported: %s", fam.GetName())
+		}
+	}
+}
+
+func TestCollectorOmitsUnknownCapacity(t *testing.T) {
+	sample := NewSample("ns", "data", "pvc-1", "node-a", 0, 40, 1, 500, 10, 4, false, stats.AvailableBytes)
+	if sample.EmitCapacity || sample.CapacityBytes != 0 || sample.AvailableBytes != 500 {
+		t.Fatalf("unknown capacity must not look full: %+v", sample)
+	}
+	c := NewCache()
+	c.Commit([]Result{{Namespace: "ns", PVC: "data", Sample: sample}}, 1)
+	reg := prometheus.NewPedanticRegistry()
+	if err := reg.Register(NewCollector(c)); err != nil {
+		t.Fatal(err)
+	}
+	fams, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fam := range fams {
+		if fam.GetName() == "kubelet_volume_stats_capacity_bytes" {
+			t.Fatal("capacity series emitted without a known size")
 		}
 	}
 }
