@@ -1,0 +1,278 @@
+// Package metrics exposes kubelet-compatible volume gauges from the last scan.
+// Series are rebuilt from the cache on every scrape, so removed PVCs disappear.
+package metrics
+
+import (
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+// Sample is one PVC. Label values are only the namespace and the claim name.
+type Sample struct {
+	Namespace      string
+	PVC            string
+	UsedBytes      float64
+	CapacityBytes  float64
+	AvailableBytes float64
+	Inodes         float64
+	InodesFree     float64
+	InodesUsed     float64
+}
+
+// Result is the outcome of measuring one volume.
+type Result struct {
+	Namespace string
+	PVC       string
+	Sample    Sample
+	Err       error
+}
+
+// NewSample builds gauges. capacity is the PVC request.
+// available is min(capacity-used, fsAvail), floored at zero.
+func NewSample(ns, pvc string, capacity, used, inodesUsed, fsAvail, fsFiles, fsFree int64, available func(int64, int64, int64) int64) Sample {
+	if used < 0 {
+		used = 0
+	}
+	if inodesUsed < 0 {
+		inodesUsed = 0
+	}
+	if fsFiles < 0 {
+		fsFiles = 0
+	}
+	if fsFree < 0 {
+		fsFree = 0
+	}
+	return Sample{
+		Namespace:      ns,
+		PVC:            pvc,
+		UsedBytes:      float64(used),
+		CapacityBytes:  float64(capacity),
+		AvailableBytes: float64(available(capacity, used, fsAvail)),
+		Inodes:         float64(fsFiles),
+		InodesFree:     float64(fsFree),
+		InodesUsed:     float64(inodesUsed),
+	}
+}
+
+// Cache stores the latest samples and scan counters.
+type Cache struct {
+	mu          sync.Mutex
+	samples     map[string]Sample
+	duration    float64
+	errors      float64
+	lastSuccess float64
+	scanned     bool
+	now         func() time.Time
+}
+
+// NewCache returns an empty cache.
+func NewCache() *Cache {
+	return &Cache{samples: map[string]Sample{}, now: time.Now}
+}
+
+// SetClock overrides the clock used for the last-success timestamp.
+func (c *Cache) SetClock(now func() time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+}
+
+// FailCycle records a cycle that could not list volumes. Previous samples stay.
+func (c *Cache) FailCycle(durationSec float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.duration = durationSec
+	c.errors++
+	c.scanned = true
+}
+
+// Commit replaces the sample set. A volume error keeps the previous sample
+// and increments the error counter. A volume absent from results is dropped.
+// last success advances when the cycle had nothing to do or measured something.
+func (c *Cache) Commit(results []Result, durationSec float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	type slot struct {
+		sample Sample
+		ok     bool
+		failed bool
+	}
+	order := make([]string, 0, len(results))
+	slots := map[string]*slot{}
+	var unnamed int
+	for _, r := range results {
+		if r.Namespace == "" || r.PVC == "" {
+			unnamed++
+			continue
+		}
+		k := r.Namespace + "\x00" + r.PVC
+		s, seen := slots[k]
+		if !seen {
+			s = &slot{}
+			slots[k] = s
+			order = append(order, k)
+		}
+		if r.Err != nil {
+			s.failed = true
+			if s.sample.Namespace == "" {
+				s.sample.Namespace = r.Namespace
+				s.sample.PVC = r.PVC
+			}
+			continue
+		}
+		s.sample = r.Sample
+		s.ok = true
+	}
+
+	next := make(map[string]Sample, len(slots))
+	successes := 0
+	failures := unnamed
+	for _, k := range order {
+		s := slots[k]
+		if s.ok {
+			next[k] = s.sample
+			successes++
+			continue
+		}
+		failures++
+		if old, ok := c.samples[k]; ok {
+			next[k] = old
+		}
+	}
+	c.samples = next
+	c.duration = durationSec
+	c.errors += float64(failures)
+	c.scanned = true
+	if successes > 0 || len(results) == 0 {
+		c.lastSuccess = float64(c.now().Unix())
+	}
+}
+
+// Snapshot is a copy of the cache for a scrape.
+type Snapshot struct {
+	Samples     []Sample
+	Duration    float64
+	Errors      float64
+	LastSuccess float64
+	Scanned     bool
+}
+
+// Snapshot copies the current cache.
+func (c *Cache) Snapshot() Snapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := Snapshot{
+		Samples:     make([]Sample, 0, len(c.samples)),
+		Duration:    c.duration,
+		Errors:      c.errors,
+		LastSuccess: c.lastSuccess,
+		Scanned:     c.scanned,
+	}
+	for _, s := range c.samples {
+		out.Samples = append(out.Samples, s)
+	}
+	return out
+}
+
+// Collector emits volume gauges from the cache on each scrape.
+type Collector struct {
+	cache      *Cache
+	used       *prometheus.Desc
+	capacity   *prometheus.Desc
+	available  *prometheus.Desc
+	inodes     *prometheus.Desc
+	inodesFree *prometheus.Desc
+	inodesUsed *prometheus.Desc
+	duration   *prometheus.Desc
+	errors     *prometheus.Desc
+	last       *prometheus.Desc
+}
+
+// NewCollector registers the kubelet volume names and the scan counters.
+func NewCollector(cache *Cache) *Collector {
+	labels := []string{"namespace", "persistentvolumeclaim"}
+	return &Collector{
+		cache: cache,
+		used: prometheus.NewDesc(
+			"kubelet_volume_stats_used_bytes",
+			"Number of used bytes in the volume",
+			labels, nil,
+		),
+		capacity: prometheus.NewDesc(
+			"kubelet_volume_stats_capacity_bytes",
+			"Capacity in bytes of the volume",
+			labels, nil,
+		),
+		available: prometheus.NewDesc(
+			"kubelet_volume_stats_available_bytes",
+			"Number of available bytes in the volume",
+			labels, nil,
+		),
+		inodes: prometheus.NewDesc(
+			"kubelet_volume_stats_inodes",
+			"Maximum number of inodes in the volume",
+			labels, nil,
+		),
+		inodesFree: prometheus.NewDesc(
+			"kubelet_volume_stats_inodes_free",
+			"Number of free inodes in the volume",
+			labels, nil,
+		),
+		inodesUsed: prometheus.NewDesc(
+			"kubelet_volume_stats_inodes_used",
+			"Number of used inodes in the volume",
+			labels, nil,
+		),
+		duration: prometheus.NewDesc(
+			"local_path_exporter_scan_duration_seconds",
+			"Duration of the last scan cycle in seconds.",
+			nil, nil,
+		),
+		errors: prometheus.NewDesc(
+			"local_path_exporter_scan_errors_total",
+			"Scan errors since process start. A failed volume keeps its previous sample.",
+			nil, nil,
+		),
+		last: prometheus.NewDesc(
+			"local_path_exporter_scan_last_success_timestamp_seconds",
+			"Unix time of the last scan cycle that measured a volume or found none.",
+			nil, nil,
+		),
+	}
+}
+
+// Describe implements prometheus.Collector.
+func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.used
+	ch <- c.capacity
+	ch <- c.available
+	ch <- c.inodes
+	ch <- c.inodesFree
+	ch <- c.inodesUsed
+	ch <- c.duration
+	ch <- c.errors
+	ch <- c.last
+}
+
+// Collect implements prometheus.Collector.
+func (c *Collector) Collect(ch chan<- prometheus.Metric) {
+	snap := c.cache.Snapshot()
+	for _, s := range snap.Samples {
+		ch <- prometheus.MustNewConstMetric(c.used, prometheus.GaugeValue, s.UsedBytes, s.Namespace, s.PVC)
+		ch <- prometheus.MustNewConstMetric(c.capacity, prometheus.GaugeValue, s.CapacityBytes, s.Namespace, s.PVC)
+		ch <- prometheus.MustNewConstMetric(c.available, prometheus.GaugeValue, s.AvailableBytes, s.Namespace, s.PVC)
+		ch <- prometheus.MustNewConstMetric(c.inodes, prometheus.GaugeValue, s.Inodes, s.Namespace, s.PVC)
+		ch <- prometheus.MustNewConstMetric(c.inodesFree, prometheus.GaugeValue, s.InodesFree, s.Namespace, s.PVC)
+		ch <- prometheus.MustNewConstMetric(c.inodesUsed, prometheus.GaugeValue, s.InodesUsed, s.Namespace, s.PVC)
+	}
+	ch <- prometheus.MustNewConstMetric(c.errors, prometheus.CounterValue, snap.Errors)
+	if snap.Scanned {
+		ch <- prometheus.MustNewConstMetric(c.duration, prometheus.GaugeValue, snap.Duration)
+	}
+	if snap.LastSuccess > 0 {
+		ch <- prometheus.MustNewConstMetric(c.last, prometheus.GaugeValue, snap.LastSuccess)
+	}
+}

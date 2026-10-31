@@ -1,0 +1,71 @@
+# Example rules. They match job="local-path-exporter" so the kubelet job,
+# which reports the node root filesystem for local-path, does not fire them.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: local-path-exporter
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: local-path-exporter
+spec:
+  groups:
+    - name: local-path-exporter
+      rules:
+        - alert: LocalPathPVCOverRequested
+          expr: |
+            (
+              kubelet_volume_stats_used_bytes{job="local-path-exporter"}
+              >
+              kubelet_volume_stats_capacity_bytes{job="local-path-exporter"}
+            )
+            and
+            kubelet_volume_stats_capacity_bytes{job="local-path-exporter"} > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} exceeds its requested size
+            description: On-disk usage is above the PVC storage request. local-path does not enforce that request.
+        - alert: LocalPathPVCGrowingFast
+          expr: |
+            (
+              predict_linear(kubelet_volume_stats_used_bytes{job="local-path-exporter"}[6h], 24 * 3600)
+              >
+              kubelet_volume_stats_capacity_bytes{job="local-path-exporter"}
+            )
+            and
+            (
+              kubelet_volume_stats_used_bytes{job="local-path-exporter"}
+              <
+              kubelet_volume_stats_capacity_bytes{job="local-path-exporter"}
+            )
+            and
+            kubelet_volume_stats_capacity_bytes{job="local-path-exporter"} > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} may exceed its request within a day
+            description: predict_linear over 6h crosses the PVC storage request in 24h.
+        - alert: LocalPathExporterDown
+          expr: up{job="local-path-exporter"} == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: local-path-exporter target {{ $labels.instance }} is down
+        - alert: LocalPathExporterScanStale
+          expr: time() - local_path_exporter_scan_last_success_timestamp_seconds{job="local-path-exporter"} > 1200
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: local-path-exporter on {{ $labels.instance }} has not finished a scan
+            description: No successful scan for 20m (default interval is 5m). A cycle where every volume fails does not refresh this timestamp.
+        - alert: LocalPathExporterScanErrors
+          expr: increase(local_path_exporter_scan_errors_total{job="local-path-exporter"}[30m]) > 2
+          labels:
+            severity: warning
+          annotations:
+            summary: local-path-exporter on {{ $labels.instance }} is failing scans
+            description: Volume timeouts and I/O errors keep the previous sample and increment local_path_exporter_scan_errors_total.

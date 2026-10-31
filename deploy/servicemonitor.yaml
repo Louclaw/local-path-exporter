@@ -1,0 +1,25 @@
+# Example for the Prometheus Operator. Point serviceMonitorSelector /
+# serviceMonitorNamespaceSelector at this object from the GitOps repo.
+# honorLabels keeps the PVC namespace label (otherwise Prometheus renames it
+# to exported_namespace). Job name is local-path-exporter, not kubelet:
+# scraping both duplicates kubelet_volume_stats_* in rules that omit job.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: local-path-exporter
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: local-path-exporter
+spec:
+  jobLabel: prometheus-job
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: local-path-exporter
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 60s
+      honorLabels: true
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
