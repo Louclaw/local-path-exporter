@@ -6,16 +6,18 @@ DaemonSet, un pod par nœud. Pas de driver CSI, pas de `hostNetwork`. Seul le r�
 
 ## Métriques
 
-Labels des séries volume, identiques au kubelet : `namespace`, `persistentvolumeclaim`. Aucune valeur chiffrée n’est mise dans un label. Les séries sont reconstruites à chaque cycle : une PVC disparue n’est plus exportée. Un timeout ou une erreur d’E/S conserve l’échantillon précédent et incrémente le compteur d’erreurs.
+Labels des séries volume : `namespace`, `persistentvolumeclaim`, `persistentvolume`, `node`. Les deux premiers sont ceux du kubelet ; `persistentvolume` est le nom du PV, ou le préfixe `pvc-<id>` si le répertoire est lu sans PV. `node` est `NODE_NAME`. Aucune valeur chiffrée n’est mise dans un label. Les séries sont reconstruites à chaque cycle : une PVC disparue n’est plus exportée. Un timeout ou une erreur d’E/S conserve l’échantillon précédent et incrémente le compteur d’erreurs.
 
 | Métrique | Sens |
 |---|---|
 | `kubelet_volume_stats_used_bytes` | Octets alloués du répertoire (`st_blocks * 512`), hardlinks dédupliqués par inode |
-| `kubelet_volume_stats_capacity_bytes` | Demande `spec.resources.requests.storage` de la PVC |
-| `kubelet_volume_stats_available_bytes` | `min(capacity - used, espace libre statfs)`, borné à 0 |
-| `kubelet_volume_stats_inodes` | Inodes du système de fichiers (`statfs`), partagés par les PVC du nœud |
-| `kubelet_volume_stats_inodes_free` | Inodes libres du système de fichiers (`statfs`) |
+| `kubelet_volume_stats_capacity_bytes` | Demande `spec.resources.requests.storage` de la PVC. Sans demande, taille totale du système de fichiers. La série est absente si les deux manquent, pour ne pas publier une capacité 0 |
+| `kubelet_volume_stats_available_bytes` | `min(capacity - used, espace libre statfs)`, borné à 0. Sans capacité connue, espace libre statfs |
+| `kubelet_volume_stats_inodes` | Inodes du système de fichiers entier (`statfs`), pas un quota de PVC |
+| `kubelet_volume_stats_inodes_free` | Inodes libres du système de fichiers entier (`statfs`), pas un quota de PVC |
 | `kubelet_volume_stats_inodes_used` | Entrées comptées dans le répertoire de la PVC |
+
+`inodes` et `inodes_free` sont identiques pour toutes les PVC d’un même disque : `statfs` décrit le système de fichiers qui porte le répertoire, pas la PVC. Seul `inodes_used` est compté dans le répertoire.
 | `local_path_exporter_scan_duration_seconds` | Durée du dernier cycle |
 | `local_path_exporter_scan_errors_total` | Erreurs de scan depuis le démarrage |
 | `local_path_exporter_scan_last_success_timestamp_seconds` | Unix time du dernier cycle qui a mesuré au moins une PVC, ou qui n’avait rien à mesurer |
@@ -28,11 +30,11 @@ Port d’écoute : **9100** (`/metrics`, `/healthz`, `/readyz`).
 
 Les noms `kubelet_volume_stats_*` sont ceux du kubelet pour réutiliser les règles existantes. Sur `local-path`, le kubelet publie le disque racine du nœud, pas le répertoire de la PVC. Si les deux cibles sont scrapées, Prometheus garde deux séries distinguées par `job`. Une alerte ou une somme qui ne filtre pas `job` compte les deux.
 
-Le `ServiceMonitor` fixe `job="local-path-exporter"` et `honorLabels: true` (sinon le namespace de la PVC devient `exported_namespace`). Les règles d’exemple filtrent ce job.
+Le `ServiceMonitor` fixe `job="local-path-exporter"` et `honorLabels: true`. Sans cela, Prometheus renomme `namespace` et `node` en `exported_namespace` et `exported_node`, parce que la cible porte déjà ces labels. Les règles d’exemple filtrent ce job.
 
 ## Mapping
 
-Informers sur `persistentvolumes` et `persistentvolumeclaims` (`get`, `list`, `watch`). `NODE_NAME` vient de l’API downward. Un PV est retenu s’il est sur ce nœud (`local.path.provisioner/selected-node`, sinon `nodeAffinity` : `kubernetes.io/hostname`, `metadata.name`, ou une clé locale-path dont l’unique valeur est le nom du nœud). Le chemin lu est `spec.local.path`, sinon `spec.hostPath.path`, et doit rester sous `STORAGE_PATH`. L’identité vient de `claimRef`. Le nom de répertoire n’est parsé qu’en secours, en coupant `_` par la droite (`pvc-<id>_<namespace>_<pvc>`, l’id peut contenir `_`).
+Informers sur `persistentvolumes` et `persistentvolumeclaims` (`get`, `list`, `watch`). `NODE_NAME` vient de l’API downward. L’informer PV est indexé par nœud : chaque cycle ne lit que les PV de ce nœud. Le watch reste sur tout le cluster, parce que le placement (annotation ou affinité) n’est pas un field selector. Un PV est retenu via `local.path.provisioner/selected-node`, sinon `nodeAffinity` (`kubernetes.io/hostname`, `metadata.name`, ou une clé locale-path dont l’unique valeur est le nom du nœud). Le chemin lu est `spec.local.path`, sinon `spec.hostPath.path`, et doit rester sous `STORAGE_PATH`. L’identité vient de `claimRef`. Le nom de répertoire n’est parsé qu’en secours, en coupant `_` par la droite (`pvc-<id>_<namespace>_<pvc>`, l’id peut contenir `_`) : `persistentvolume` vaut alors ce préfixe `pvc-<id>`.
 
 Les quotas projet XFS ne sont pas lus (hors périmètre). Il n’y a pas d’option pour les activer : `local-path` ne pose pas de quota, donc l’usage peut dépasser la demande.
 
@@ -59,7 +61,9 @@ Manifests d’exemple, base d’une PR GitOps séparée. Ils ne sont pas appliqu
 - `deploy/servicemonitor.yaml`
 - `deploy/prometheusrule.yaml`
 
-Image publiée sur `ghcr.io/louclaw/local-path-exporter` uniquement pour un push sur `main` (`:main`, `:sha-<12>`) et les tags `v*` (le tag git). linux/amd64 et linux/arm64.
+Image publiée sur `ghcr.io/louclaw/local-path-exporter` uniquement pour un push sur `main` (`:main`, `:sha-<commit>`) et les tags `v*` (`vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, plus le sha), via `docker/metadata-action`. linux/amd64 et linux/arm64.
+
+Le DaemonSet d’exemple épingle `v0.1.0` avec `imagePullPolicy: IfNotPresent`. Ne pas suivre le tag mouvant `:main`. Au déploiement, remplacer ce tag par le `vX.Y.Z` ou le digest réellement publié.
 
 ## Build
 

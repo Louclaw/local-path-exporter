@@ -16,25 +16,78 @@ const SelectedNodeAnnotation = "local.path.provisioner/selected-node"
 
 // Volume is one PVC directory to measure on this node.
 type Volume struct {
-	Path      string
-	Namespace string
-	Name      string
-	Capacity  int64
-	FromPV    bool
+	Path            string
+	Namespace       string
+	Name            string
+	PV              string
+	Node            string
+	Capacity        int64
+	CapacityFromPVC bool
+	FromPV          bool
 }
 
 // ParseDirName splits pvc-<id>_<namespace>_<name> from the right.
-// The id prefix may contain underscores; namespace and name are the last two fields.
-func ParseDirName(name string) (namespace, pvc string, ok bool) {
+// The returned PV name is the pvc-<id> prefix. The id may contain underscores;
+// namespace and name are the last two fields.
+func ParseDirName(name string) (pv, namespace, pvc string, ok bool) {
 	rest, pvc, ok1 := cutLast(name, "_")
 	id, namespace, ok2 := cutLast(rest, "_")
-	if !ok1 || !ok2 || !validIdent(namespace) || !validIdent(pvc) {
-		return "", "", false
+	if !ok1 || !ok2 || !validIdent(namespace) || !validIdent(pvc) || !validIdent(id) {
+		return "", "", "", false
 	}
 	if !strings.HasPrefix(id, "pvc-") || len(id) <= len("pvc-") {
-		return "", "", false
+		return "", "", "", false
 	}
-	return namespace, pvc, true
+	return id, namespace, pvc, true
+}
+
+// IndexedNodes lists the nodes an informer index should file this PV under.
+// The watch stays cluster-wide: node placement is not a field selector.
+func IndexedNodes(pv *corev1.PersistentVolume) []string {
+	if pv == nil {
+		return nil
+	}
+	if ann := pv.Annotations[SelectedNodeAnnotation]; ann != "" {
+		if OnNode(pv, ann) {
+			return []string{ann}
+		}
+		return nil
+	}
+	aff := pv.Spec.NodeAffinity
+	if aff == nil || aff.Required == nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	consider := func(values []string) {
+		for _, name := range values {
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			if !OnNode(pv, name) {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	for _, term := range aff.Required.NodeSelectorTerms {
+		for _, exp := range term.MatchExpressions {
+			if exp.Operator == corev1.NodeSelectorOpIn {
+				consider(exp.Values)
+			}
+		}
+		for _, exp := range term.MatchFields {
+			if exp.Operator == corev1.NodeSelectorOpIn {
+				consider(exp.Values)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // OnNode reports whether the PV is pinned to nodeName.
@@ -73,7 +126,7 @@ func Resolve(pvs []*corev1.PersistentVolume, pvcs []*corev1.PersistentVolumeClai
 		if pth == "" {
 			continue
 		}
-		ns, name, ok := identity(pv, filepath.Base(pth))
+		pvName, ns, name, ok := identity(pv, filepath.Base(pth))
 		if !ok {
 			continue
 		}
@@ -81,13 +134,7 @@ func Resolve(pvs []*corev1.PersistentVolume, pvcs []*corev1.PersistentVolumeClai
 		if prev, exists := byKey[key]; exists && prev.FromPV {
 			continue
 		}
-		byKey[key] = Volume{
-			Path:      pth,
-			Namespace: ns,
-			Name:      name,
-			Capacity:  caps[key],
-			FromPV:    true,
-		}
+		byKey[key] = volume(pth, ns, name, pvName, nodeName, caps, true)
 	}
 
 	covered := map[string]struct{}{}
@@ -103,7 +150,7 @@ func Resolve(pvs []*corev1.PersistentVolume, pvcs []*corev1.PersistentVolumeClai
 		if _, ok := covered[pth]; ok {
 			continue
 		}
-		ns, name, ok := ParseDirName(dir)
+		pvName, ns, name, ok := ParseDirName(dir)
 		if !ok {
 			continue
 		}
@@ -111,13 +158,7 @@ func Resolve(pvs []*corev1.PersistentVolume, pvcs []*corev1.PersistentVolumeClai
 		if _, exists := byKey[key]; exists {
 			continue
 		}
-		byKey[key] = Volume{
-			Path:      pth,
-			Namespace: ns,
-			Name:      name,
-			Capacity:  caps[key],
-			FromPV:    false,
-		}
+		byKey[key] = volume(pth, ns, name, pvName, nodeName, caps, false)
 	}
 
 	out := make([]Volume, 0, len(byKey))
@@ -133,6 +174,22 @@ func Resolve(pvs []*corev1.PersistentVolume, pvcs []*corev1.PersistentVolumeClai
 	return out
 }
 
+func volume(path, ns, name, pvName, node string, caps map[string]int64, fromPV bool) Volume {
+	vol := Volume{
+		Path:      path,
+		Namespace: ns,
+		Name:      name,
+		PV:        pvName,
+		Node:      node,
+		FromPV:    fromPV,
+	}
+	if bytes, ok := caps[ns+"/"+name]; ok && bytes > 0 {
+		vol.Capacity = bytes
+		vol.CapacityFromPVC = true
+	}
+	return vol
+}
+
 func capacities(pvcs []*corev1.PersistentVolumeClaim) map[string]int64 {
 	out := make(map[string]int64, len(pvcs))
 	for _, pvc := range pvcs {
@@ -140,7 +197,7 @@ func capacities(pvcs []*corev1.PersistentVolumeClaim) map[string]int64 {
 			continue
 		}
 		q, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-		if !ok {
+		if !ok || q.Value() <= 0 {
 			continue
 		}
 		out[pvc.Namespace+"/"+pvc.Name] = q.Value()
@@ -148,11 +205,18 @@ func capacities(pvcs []*corev1.PersistentVolumeClaim) map[string]int64 {
 	return out
 }
 
-func identity(pv *corev1.PersistentVolume, base string) (string, string, bool) {
-	if ref := pv.Spec.ClaimRef; ref != nil && validIdent(ref.Namespace) && validIdent(ref.Name) {
-		return ref.Namespace, ref.Name, true
+func identity(pv *corev1.PersistentVolume, base string) (pvName, namespace, name string, ok bool) {
+	if ref := pv.Spec.ClaimRef; ref != nil && validIdent(ref.Namespace) && validIdent(ref.Name) && validIdent(pv.Name) {
+		return pv.Name, ref.Namespace, ref.Name, true
 	}
-	return ParseDirName(base)
+	parsed, ns, pvcName, pok := ParseDirName(base)
+	if !pok {
+		return "", "", "", false
+	}
+	if validIdent(pv.Name) {
+		return pv.Name, ns, pvcName, true
+	}
+	return parsed, ns, pvcName, true
 }
 
 // pathWithin returns the first local or hostPath path that stays inside storagePath.

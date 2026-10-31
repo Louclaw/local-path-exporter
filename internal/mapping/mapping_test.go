@@ -9,24 +9,24 @@ import (
 )
 
 func TestParseDirNameRightSplit(t *testing.T) {
-	ns, name, ok := ParseDirName("pvc-uid_ns_data")
-	if !ok || ns != "ns" || name != "data" {
-		t.Fatalf("got %q %q ok=%v", ns, name, ok)
+	pv, ns, name, ok := ParseDirName("pvc-uid_ns_data")
+	if !ok || pv != "pvc-uid" || ns != "ns" || name != "data" {
+		t.Fatalf("got %q %q %q ok=%v", pv, ns, name, ok)
 	}
-	ns, name, ok = ParseDirName("pvc-uid_extra_my-ns_my-pvc")
-	if !ok || ns != "my-ns" || name != "my-pvc" {
-		t.Fatalf("right split got %q %q ok=%v", ns, name, ok)
+	pv, ns, name, ok = ParseDirName("pvc-uid_extra_my-ns_my-pvc")
+	if !ok || pv != "pvc-uid_extra" || ns != "my-ns" || name != "my-pvc" {
+		t.Fatalf("right split got %q %q %q ok=%v", pv, ns, name, ok)
 	}
-	if _, _, ok := ParseDirName("foo_ns_data"); ok {
+	if _, _, _, ok := ParseDirName("foo_ns_data"); ok {
 		t.Fatal("prefix must be pvc-")
 	}
-	if _, _, ok := ParseDirName("pvc-_ns_data"); ok {
+	if _, _, _, ok := ParseDirName("pvc-_ns_data"); ok {
 		t.Fatal("empty id must be rejected")
 	}
-	if _, _, ok := ParseDirName("pvc-uid_ns"); ok {
+	if _, _, _, ok := ParseDirName("pvc-uid_ns"); ok {
 		t.Fatal("two fields must be rejected")
 	}
-	if _, _, ok := ParseDirName("pvc-uid_ns_"); ok {
+	if _, _, _, ok := ParseDirName("pvc-uid_ns_"); ok {
 		t.Fatal("empty name must be rejected")
 	}
 }
@@ -60,8 +60,11 @@ func TestResolveUsesClaimAndPVCRequest(t *testing.T) {
 	if data.Namespace != "ns" || data.Name != "data" || !data.FromPV {
 		t.Fatalf("identity: %#v", got)
 	}
-	if data.Capacity != 2*(1<<30) {
-		t.Fatalf("capacity = %d, want PVC request 2Gi not PV capacity", data.Capacity)
+	if !data.CapacityFromPVC || data.Capacity != 2*(1<<30) {
+		t.Fatalf("capacity = %d fromPVC=%v, want PVC request 2Gi not PV capacity", data.Capacity, data.CapacityFromPVC)
+	}
+	if data.PV != "pvc-1" || data.Node != "node-a" {
+		t.Fatalf("labels pv=%s node=%s", data.PV, data.Node)
 	}
 	if data.Path != root+"/pvc-1_ns_other" {
 		t.Fatalf("path %s", data.Path)
@@ -135,8 +138,22 @@ func TestResolveFallbackWhenNoPV(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %#v", got)
 	}
-	if got[0].FromPV || got[0].Namespace != "team" || got[0].Name != "logs" || got[0].Capacity != 1<<30 {
+	if got[0].FromPV || got[0].Namespace != "team" || got[0].Name != "logs" || !got[0].CapacityFromPVC || got[0].Capacity != 1<<30 {
 		t.Fatalf("fallback: %#v", got[0])
+	}
+	if got[0].PV != "pvc-abc_def" || got[0].Node != "node-a" {
+		t.Fatalf("fallback pv label: %#v", got[0])
+	}
+}
+
+func TestResolveWithoutStorageRequest(t *testing.T) {
+	const root = "/var/lib/rancher/k3s/storage"
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "logs"},
+	}
+	got := Resolve(nil, []*corev1.PersistentVolumeClaim{pvc}, "node-a", root, []string{"pvc-abc_team_logs"})
+	if len(got) != 1 || got[0].CapacityFromPVC || got[0].Capacity != 0 {
+		t.Fatalf("missing request must not publish a zero PVC capacity: %#v", got)
 	}
 }
 
@@ -145,8 +162,22 @@ func TestResolvePVWinsOverDirName(t *testing.T) {
 	dir := "pvc-abc_wrong_wrong"
 	pv := hostPathPV("pvc-abc", "node-a", root+"/"+dir, "real", "claim")
 	got := Resolve([]*corev1.PersistentVolume{pv}, nil, "node-a", root, []string{dir})
-	if len(got) != 1 || got[0].Namespace != "real" || got[0].Name != "claim" || !got[0].FromPV {
+	if len(got) != 1 || got[0].Namespace != "real" || got[0].Name != "claim" || !got[0].FromPV || got[0].PV != "pvc-abc" {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestIndexedNodes(t *testing.T) {
+	pv := hostPathPV("pvc-1", "node-a", "/var/lib/rancher/k3s/storage/x", "ns", "c")
+	if got := IndexedNodes(pv); len(got) != 1 || got[0] != "node-a" {
+		t.Fatalf("annotation index: %v", got)
+	}
+	bare := &corev1.PersistentVolume{Spec: corev1.PersistentVolumeSpec{NodeAffinity: affinity(corev1.LabelHostname, "node-b")}}
+	if got := IndexedNodes(bare); len(got) != 1 || got[0] != "node-b" {
+		t.Fatalf("affinity index: %v", got)
+	}
+	if IndexedNodes(&corev1.PersistentVolume{}) != nil {
+		t.Fatal("unpinned PV must not be indexed")
 	}
 }
 

@@ -69,3 +69,11 @@ spec:
           annotations:
             summary: local-path-exporter on {{ $labels.instance }} is failing scans
             description: Volume timeouts and I/O errors keep the previous sample and increment local_path_exporter_scan_errors_total.
+        - alert: LocalPathExporterScanSlow
+          expr: local_path_exporter_scan_duration_seconds{job="local-path-exporter"} > 240
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: local-path-exporter scan on {{ $labels.instance }} is slow
+            description: The last cycle took more than 4 minutes. The default interval is 5 minutes, and each PVC walk is capped by SCAN_TIMEOUT.

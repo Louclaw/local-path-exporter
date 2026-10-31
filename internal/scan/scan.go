@@ -20,8 +20,10 @@ type Usage struct {
 }
 
 // Report adds filesystem-wide statfs figures for the volume's device.
+// TotalBytes, Files and FilesFree describe that whole filesystem.
 type Report struct {
 	Usage      Usage
+	TotalBytes int64
 	AvailBytes int64
 	Files      int64
 	FilesFree  int64
@@ -55,11 +57,11 @@ func Inspect(ctx context.Context, root string) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	avail, files, free, err := statfs(root)
+	total, avail, files, free, err := statfs(root)
 	if err != nil {
 		return Report{}, fmt.Errorf("statfs %s: %w", root, err)
 	}
-	return Report{Usage: u, AvailBytes: avail, Files: files, FilesFree: free}, nil
+	return Report{Usage: u, TotalBytes: total, AvailBytes: avail, Files: files, FilesFree: free}, nil
 }
 
 // ChildDirs lists immediate real directories. Symlinks are not included.
@@ -169,15 +171,17 @@ func (osWalker) list(path string) ([]string, error) {
 	return f.Readdirnames(-1)
 }
 
-func statfs(path string) (avail, files, filesFree int64, err error) {
+func statfs(path string) (total, avail, files, filesFree int64, err error) {
 	var st unix.Statfs_t
 	if err = unix.Statfs(path, &st); err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
+	files, filesFree = clampUint(st.Files), clampUint(st.Ffree)
 	if st.Bsize <= 0 {
-		return 0, clampUint(st.Files), clampUint(st.Ffree), nil
+		return 0, 0, files, filesFree, nil
 	}
-	return mul(uint64(st.Bavail), uint64(st.Bsize)), clampUint(st.Files), clampUint(st.Ffree), nil
+	bsize := uint64(st.Bsize)
+	return mul(st.Blocks, bsize), mul(st.Bavail, bsize), files, filesFree, nil
 }
 
 func mul(a, b uint64) int64 {

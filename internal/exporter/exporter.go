@@ -49,13 +49,19 @@ func RunOnce(ctx context.Context, vols []mapping.Volume, inspect InspectFunc, ca
 				results[i] = metrics.Result{Namespace: vol.Namespace, PVC: vol.Name, Err: err}
 				return
 			}
+			capacity, emit := vol.Capacity, vol.CapacityFromPVC && vol.Capacity > 0
+			if !emit && rep.TotalBytes > 0 {
+				capacity, emit = rep.TotalBytes, true
+			}
 			results[i] = metrics.Result{
 				Namespace: vol.Namespace,
 				PVC:       vol.Name,
 				Sample: metrics.NewSample(
-					vol.Namespace, vol.Name, vol.Capacity,
+					vol.Namespace, vol.Name, vol.PV, vol.Node,
+					capacity,
 					rep.Usage.Bytes, rep.Usage.Inodes,
 					rep.AvailBytes, rep.Files, rep.FilesFree,
+					emit,
 					stats.AvailableBytes,
 				),
 			}
