@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/rest"
 	toolcache "k8s.io/client-go/tools/cache"
 
+	"github.com/Louclaw/local-path-exporter/internal/cgroup"
 	"github.com/Louclaw/local-path-exporter/internal/config"
 	"github.com/Louclaw/local-path-exporter/internal/exporter"
 	"github.com/Louclaw/local-path-exporter/internal/mapping"
@@ -47,6 +48,7 @@ func main() {
 	store := metrics.NewCache()
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(metrics.NewCollector(store))
+	reg.MustRegister(cgroup.NewCollector())
 
 	var ready atomic.Bool
 	srv := &http.Server{
@@ -95,6 +97,7 @@ func main() {
 		pvIndex: pvInf.Informer().GetIndexer(),
 		pvcs:    pvcInf.Lister(),
 		cache:   store,
+		pace:    exporter.NewPacer(cfg.LargeEntries, cfg.LargeInterval),
 	}
 	app.loop(ctx, &ready)
 }
@@ -106,6 +109,7 @@ type application struct {
 	pvIndex toolcache.Indexer
 	pvcs    corev1listers.PersistentVolumeClaimLister
 	cache   *metrics.Cache
+	pace    *exporter.Pacer
 }
 
 func indexPVByNode(obj interface{}) ([]string, error) {
@@ -160,7 +164,7 @@ func (a *application) cycle(ctx context.Context) bool {
 	}
 	vols := mapping.Resolve(pvs, pvcs, a.cfg.NodeName, a.cfg.StoragePath, names)
 	before := a.cache.Snapshot().Errors
-	exporter.RunOnce(ctx, vols, inspect, a.cache, a.cfg.Parallelism, a.cfg.ScanTimeout, start)
+	exporter.RunOnce(ctx, vols, inspect, a.cache, a.cfg.Parallelism, a.cfg.ScanTimeout, start, a.pace)
 	snap := a.cache.Snapshot()
 	slog.Info("scan finished", "volumes", len(vols), "errors", snap.Errors-before, "seconds", time.Since(start).Seconds())
 	return true
@@ -186,10 +190,34 @@ func inspect(ctx context.Context, path string) (scan.Report, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	priority.Lower()
+	before := cgroup.Read()
+	start := time.Now()
 	rep, err := scan.Inspect(ctx, path)
-	if err != nil {
-		slog.Warn("scan volume", "path", path, "err", err)
+	after := cgroup.Read()
+	elapsed := time.Since(start)
+	attrs := []any{
+		"path", path,
+		"seconds", elapsed.Seconds(),
+		"entries", rep.Usage.Entries,
+		"inodes", rep.Usage.Inodes,
+		"bytes", rep.Usage.Bytes,
+		"cgroup_current", after.Current,
+		"delta_current", int64(after.Current) - int64(before.Current),
+		"delta_anon", int64(after.Anon) - int64(before.Anon),
+		"delta_file", int64(after.File) - int64(before.File),
+		"delta_slab_reclaimable", int64(after.SlabReclaimable) - int64(before.SlabReclaimable),
+		"delta_slab_unreclaimable", int64(after.SlabUnreclaimable) - int64(before.SlabUnreclaimable),
+		"delta_kernel", int64(after.Kernel) - int64(before.Kernel),
+		"go_heap", after.Heap,
+		"delta_heap", int64(after.Heap) - int64(before.Heap),
 	}
+	if err != nil {
+		attrs = append(attrs, "err", err)
+		slog.Warn("scan volume", attrs...)
+	} else {
+		slog.Info("scan volume", attrs...)
+	}
+	cgroup.Release()
 	return rep, err
 }
 

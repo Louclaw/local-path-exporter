@@ -115,6 +115,9 @@ kubelet_volume_stats_used_bytes{namespace="ns",node="node-a",persistentvolume="p
 # HELP local_path_exporter_scan_duration_seconds Duration of the last scan cycle in seconds.
 # TYPE local_path_exporter_scan_duration_seconds gauge
 local_path_exporter_scan_duration_seconds 1.25
+# HELP local_path_exporter_scan_entries Directory entries walked during the last scan cycle. A volume skipped by the large-volume interval adds none.
+# TYPE local_path_exporter_scan_entries gauge
+local_path_exporter_scan_entries 0
 # HELP local_path_exporter_scan_errors_total Scan errors since process start. A failed volume keeps its previous sample.
 # TYPE local_path_exporter_scan_errors_total counter
 local_path_exporter_scan_errors_total 0

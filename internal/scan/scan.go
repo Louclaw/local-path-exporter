@@ -15,12 +15,17 @@ import (
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Louclaw/local-path-exporter/internal/cgroup"
 )
 
 // Usage is the allocated size and the number of directory entries counted.
+// Entries is every name walked, including a hard link seen again.
+// Inodes counts each inode once.
 type Usage struct {
-	Bytes  int64
-	Inodes int64
+	Bytes   int64
+	Inodes  int64
+	Entries int64
 }
 
 // Report adds filesystem-wide statfs figures for the volume's device.
@@ -110,6 +115,8 @@ func measure(ctx context.Context, w walker, root string) (Usage, error) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		usage.Entries++
+		cgroup.Note(usage.Entries)
 		if st.dev != rootStat.dev {
 			return nil
 		}

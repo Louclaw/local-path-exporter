@@ -9,32 +9,38 @@ import (
 )
 
 const (
-	DefaultStoragePath = "/var/lib/rancher/k3s/storage"
-	DefaultMetricsAddr = ":9100"
-	DefaultInterval    = 5 * time.Minute
-	DefaultTimeout     = 2 * time.Minute
-	DefaultParallelism = 1
+	DefaultStoragePath   = "/var/lib/rancher/k3s/storage"
+	DefaultMetricsAddr   = ":9100"
+	DefaultInterval      = 5 * time.Minute
+	DefaultTimeout       = 2 * time.Minute
+	DefaultParallelism   = 1
+	DefaultLargeEntries  = 100_000
+	DefaultLargeInterval = 30 * time.Minute
 )
 
 // Config is the process configuration.
 type Config struct {
-	NodeName     string
-	StoragePath  string
-	MetricsAddr  string
-	ScanInterval time.Duration
-	ScanTimeout  time.Duration
-	Parallelism  int
+	NodeName      string
+	StoragePath   string
+	MetricsAddr   string
+	ScanInterval  time.Duration
+	ScanTimeout   time.Duration
+	Parallelism   int
+	LargeEntries  int64
+	LargeInterval time.Duration
 }
 
 // FromEnv loads Config. NODE_NAME is required.
 func FromEnv() (Config, error) {
 	cfg := Config{
-		NodeName:     os.Getenv("NODE_NAME"),
-		StoragePath:  envOr("STORAGE_PATH", DefaultStoragePath),
-		MetricsAddr:  envOr("METRICS_ADDR", DefaultMetricsAddr),
-		ScanInterval: DefaultInterval,
-		ScanTimeout:  DefaultTimeout,
-		Parallelism:  DefaultParallelism,
+		NodeName:      os.Getenv("NODE_NAME"),
+		StoragePath:   envOr("STORAGE_PATH", DefaultStoragePath),
+		MetricsAddr:   envOr("METRICS_ADDR", DefaultMetricsAddr),
+		ScanInterval:  DefaultInterval,
+		ScanTimeout:   DefaultTimeout,
+		Parallelism:   DefaultParallelism,
+		LargeEntries:  DefaultLargeEntries,
+		LargeInterval: DefaultLargeInterval,
 	}
 	if cfg.NodeName == "" {
 		return Config{}, fmt.Errorf("NODE_NAME is required")
@@ -49,6 +55,12 @@ func FromEnv() (Config, error) {
 	if cfg.Parallelism, err = intEnv("SCAN_PARALLELISM", DefaultParallelism); err != nil {
 		return Config{}, err
 	}
+	if cfg.LargeEntries, err = int64Env("SCAN_LARGE_ENTRIES", DefaultLargeEntries); err != nil {
+		return Config{}, err
+	}
+	if cfg.LargeInterval, err = durationEnv("SCAN_LARGE_INTERVAL", DefaultLargeInterval); err != nil {
+		return Config{}, err
+	}
 	if cfg.ScanInterval <= 0 {
 		return Config{}, fmt.Errorf("SCAN_INTERVAL must be positive")
 	}
@@ -57,6 +69,12 @@ func FromEnv() (Config, error) {
 	}
 	if cfg.Parallelism < 1 {
 		return Config{}, fmt.Errorf("SCAN_PARALLELISM must be >= 1")
+	}
+	if cfg.LargeEntries < 0 {
+		return Config{}, fmt.Errorf("SCAN_LARGE_ENTRIES must be >= 0")
+	}
+	if cfg.LargeInterval < 0 {
+		return Config{}, fmt.Errorf("SCAN_LARGE_INTERVAL must be >= 0")
 	}
 	return cfg, nil
 }
@@ -78,6 +96,18 @@ func durationEnv(key string, fallback time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}
 	return d, nil
+}
+
+func int64Env(key string, fallback int64) (int64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return n, nil
 }
 
 func intEnv(key string, fallback int) (int, error) {

@@ -25,7 +25,7 @@ func TestRunOnceTimeoutKeepsPrevious(t *testing.T) {
 	RunOnce(context.Background(), vols, func(ctx context.Context, path string) (scan.Report, error) {
 		<-ctx.Done()
 		return scan.Report{}, ctx.Err()
-	}, cache, 1, 20*time.Millisecond, time.Now())
+	}, cache, 1, 20*time.Millisecond, time.Now(), nil)
 
 	snap := cache.Snapshot()
 	if len(snap.Samples) != 1 || snap.Samples[0].UsedBytes != 23 {
@@ -77,7 +77,7 @@ func TestRunOnceParallelismAndMath(t *testing.T) {
 	cache := metrics.NewCache()
 	done := make(chan struct{})
 	go func() {
-		RunOnce(context.Background(), vols, inspect, cache, 2, time.Minute, time.Now())
+		RunOnce(context.Background(), vols, inspect, cache, 2, time.Minute, time.Now(), nil)
 		close(done)
 	}()
 	for i := 0; i < 2; i++ {
@@ -126,7 +126,7 @@ func TestRunOnceFilesystemCapacity(t *testing.T) {
 			Files:      10,
 			FilesFree:  8,
 		}, nil
-	}, cache, 1, time.Second, time.Now())
+	}, cache, 1, time.Second, time.Now(), nil)
 	snap := cache.Snapshot()
 	if len(snap.Samples) != 1 {
 		t.Fatal(snap.Samples)
@@ -144,8 +144,31 @@ func TestRunOnceParentCancel(t *testing.T) {
 	RunOnce(ctx, []mapping.Volume{{Path: "/a", Namespace: "ns", Name: "a"}}, func(ctx context.Context, path string) (scan.Report, error) {
 		t.Fatal("inspect should not run")
 		return scan.Report{}, nil
-	}, cache, 1, time.Second, time.Now())
+	}, cache, 1, time.Second, time.Now(), nil)
 	if cache.Snapshot().Errors != 1 {
 		t.Fatal("expected error")
+	}
+}
+
+func TestPacerSkipsLargeVolume(t *testing.T) {
+	cache := metrics.NewCache()
+	var calls atomic.Int32
+	inspect := func(ctx context.Context, path string) (scan.Report, error) {
+		calls.Add(1)
+		return scan.Report{Usage: scan.Usage{Bytes: 10, Inodes: 4, Entries: 100}}, nil
+	}
+	vol := mapping.Volume{Path: "/big", Namespace: "ns", Name: "big", PV: "pvc-big", Node: "n", Capacity: 100, CapacityFromPVC: true}
+	pace := NewPacer(50, time.Hour)
+	RunOnce(context.Background(), []mapping.Volume{vol}, inspect, cache, 1, time.Second, time.Now(), pace)
+	if calls.Load() != 1 || cache.Snapshot().Entries != 100 {
+		t.Fatalf("calls=%d entries=%v", calls.Load(), cache.Snapshot().Entries)
+	}
+	RunOnce(context.Background(), []mapping.Volume{vol}, inspect, cache, 1, time.Second, time.Now(), pace)
+	if calls.Load() != 1 {
+		t.Fatalf("large volume scanned again: %d", calls.Load())
+	}
+	snap := cache.Snapshot()
+	if len(snap.Samples) != 1 || snap.Samples[0].UsedBytes != 10 || snap.Entries != 0 {
+		t.Fatalf("skipped cycle lost the sample: %+v entries=%v", snap.Samples, snap.Entries)
 	}
 }

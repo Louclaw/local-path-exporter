@@ -245,6 +245,7 @@ func oracleUsage(t *testing.T, root string) Usage {
 		if err != nil {
 			return err
 		}
+		usage.Entries++
 		var st unix.Stat_t
 		if err := unix.Lstat(path, &st); err != nil {
 			return err
