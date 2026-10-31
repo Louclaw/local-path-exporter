@@ -37,7 +37,7 @@ spec:
       containers:
         - name: exporter
           # Pin a release tag or digest. Do not track the moving :main tag.
-          image: ghcr.io/louclaw/local-path-exporter:v0.1.0
+          image: ghcr.io/louclaw/local-path-exporter:v0.1.1
           imagePullPolicy: IfNotPresent
           ports:
             - name: metrics
@@ -56,7 +56,11 @@ spec:
             - name: SCAN_TIMEOUT
               value: 2m
             - name: SCAN_PARALLELISM
-              value: "2"
+              value: "1"
+            # Soft heap cap under the 128Mi cgroup limit, so the GC
+            # runs before the OOM killer. The limit itself stays 128Mi.
+            - name: GOMEMLIMIT
+              value: "100MiB"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

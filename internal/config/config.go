@@ -13,7 +13,7 @@ const (
 	DefaultMetricsAddr = ":9100"
 	DefaultInterval    = 5 * time.Minute
 	DefaultTimeout     = 2 * time.Minute
-	DefaultParallelism = 2
+	DefaultParallelism = 1
 )
 
 // Config is the process configuration.

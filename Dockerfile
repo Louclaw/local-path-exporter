@@ -12,6 +12,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build --chmod=755 /out/local-path-exporter /local-path-exporter
+# Soft heap cap under the 128Mi cgroup limit used by the example DaemonSet.
+ENV GOMEMLIMIT=100MiB
 # UID 0 so the runtime puts DAC_READ_SEARCH in the effective set.
 # A non-root user plus allowPrivilegeEscalation=false never does.
 USER 0:0

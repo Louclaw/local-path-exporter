@@ -1,6 +1,10 @@
 // Package scan measures one PVC directory without crossing filesystems
 // or following symlinks. Hard links are counted once per inode.
-// Allocated size is st_blocks * 512.
+// Only inodes with nlink > 1 are remembered: a regular file cannot appear
+// again, so the dedup set stays proportional to hard links and directories
+// rather than to every file. Directory entries are read in fixed-size batches
+// and files are counted immediately, so a large cache directory is not held
+// in memory. Allocated size is st_blocks * 512.
 package scan
 
 import (
@@ -32,14 +36,21 @@ type Report struct {
 type fileStat struct {
 	dev    uint64
 	ino    uint64
+	nlink  uint64
 	blocks int64
 	mode   uint32
 }
 
 type walker interface {
 	lstat(path string) (fileStat, error)
-	list(path string) ([]string, error)
+	// readDir calls fn for each child, in batches. It must not retain every
+	// name from the directory at once.
+	readDir(path string, fn func(name string) error) error
 }
+
+// direntBufSize is the getdents buffer. One batch is all that is live while
+// the names in it are counted. Tests shrink it to force several reads.
+var direntBufSize = 32 << 10
 
 // Measure walks root. A timeout or I/O error fails the whole walk so the
 // caller can keep the previous sample.
@@ -65,6 +76,7 @@ func Inspect(ctx context.Context, root string) (Report, error) {
 }
 
 // ChildDirs lists immediate real directories. Symlinks are not included.
+// This is the storage root (one entry per PVC), not the per-volume walk.
 func ChildDirs(path string) ([]string, error) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -80,55 +92,60 @@ func ChildDirs(path string) ([]string, error) {
 }
 
 func measure(ctx context.Context, w walker, root string) (Usage, error) {
+	if err := ctx.Err(); err != nil {
+		return Usage{}, err
+	}
 	rootStat, err := w.lstat(root)
 	if err != nil {
 		return Usage{}, err
 	}
-	rootDev := rootStat.dev
-	seen := map[uint64]struct{}{}
-	stack := []string{root}
+	// Only multi-linked inodes can be reached twice. Remembering every file
+	// made a cache directory of a few hundred thousand entries exceed the
+	// 128Mi pod limit.
+	seen := make(map[uint64]struct{})
 	var usage Usage
 
-	for len(stack) > 0 {
+	var walk func(path string, st fileStat) error
+	walk = func(path string, st fileStat) error {
 		if err := ctx.Err(); err != nil {
-			return Usage{}, err
+			return err
 		}
-		path := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		st, err := w.lstat(path)
-		if err != nil {
-			if os.IsNotExist(err) && path != root {
-				continue
+		if st.dev != rootStat.dev {
+			return nil
+		}
+		if st.nlink > 1 {
+			if _, ok := seen[st.ino]; ok {
+				return nil
 			}
-			return Usage{}, err
+			seen[st.ino] = struct{}{}
 		}
-		if st.dev != rootDev {
-			continue
-		}
-		if _, ok := seen[st.ino]; ok {
-			continue
-		}
-		seen[st.ino] = struct{}{}
 		usage.Bytes += blocksToBytes(st.blocks)
 		usage.Inodes++
 
 		if !isDir(st.mode) || isSymlink(st.mode) {
-			continue
+			return nil
 		}
-		names, err := w.list(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return Usage{}, err
-		}
-		for _, name := range names {
+		err := w.readDir(path, func(name string) error {
 			if !filepath.IsLocal(name) {
-				continue
+				return nil
 			}
-			stack = append(stack, filepath.Join(path, name))
+			child := filepath.Join(path, name)
+			cst, err := w.lstat(child)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			return walk(child, cst)
+		})
+		if err != nil && os.IsNotExist(err) {
+			return nil
 		}
+		return err
+	}
+	if err := walk(root, rootStat); err != nil {
+		return Usage{}, err
 	}
 	return usage, nil
 }
@@ -158,17 +175,45 @@ func (osWalker) lstat(path string) (fileStat, error) {
 	if err := unix.Lstat(path, &st); err != nil {
 		return fileStat{}, err
 	}
-	return fileStat{dev: uint64(st.Dev), ino: st.Ino, blocks: st.Blocks, mode: uint32(st.Mode)}, nil
+	return fileStat{
+		dev:    uint64(st.Dev),
+		ino:    st.Ino,
+		nlink:  uint64(st.Nlink),
+		blocks: st.Blocks,
+		mode:   uint32(st.Mode),
+	}, nil
 }
 
-func (osWalker) list(path string) ([]string, error) {
+func (osWalker) readDir(path string, fn func(name string) error) error {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	f := os.NewFile(uintptr(fd), path)
-	defer f.Close()
-	return f.Readdirnames(-1)
+	defer unix.Close(fd)
+
+	buf := make([]byte, direntBufSize)
+	var names []string
+	for {
+		n, err := unix.ReadDirent(fd, buf)
+		if n > 0 {
+			names = names[:0]
+			_, _, names = unix.ParseDirent(buf[:n], -1, names)
+			for _, name := range names {
+				if callErr := fn(name); callErr != nil {
+					return callErr
+				}
+			}
+		}
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+	}
 }
 
 func statfs(path string) (total, avail, files, filesFree int64, err error) {

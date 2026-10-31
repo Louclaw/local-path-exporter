@@ -3,6 +3,7 @@ package exporter
 
 import (
 	"context"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -16,7 +17,9 @@ import (
 type InspectFunc func(ctx context.Context, path string) (scan.Report, error)
 
 // RunOnce measures vols with at most parallelism walks at a time.
-// Each walk uses its own timeout. The cache is updated once, after every walk returns.
+// Each walk uses its own timeout. When a walk returns, unused pages are
+// released before the semaphore is freed, so the next volume does not start
+// on top of the previous heap. The cache is updated once, after every walk returns.
 func RunOnce(ctx context.Context, vols []mapping.Volume, inspect InspectFunc, cache *metrics.Cache, parallelism int, timeout time.Duration, started time.Time) {
 	if parallelism < 1 {
 		parallelism = 1
@@ -34,6 +37,7 @@ func RunOnce(ctx context.Context, vols []mapping.Volume, inspect InspectFunc, ca
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
+				defer debug.FreeOSMemory()
 			case <-ctx.Done():
 				results[i] = metrics.Result{Namespace: vol.Namespace, PVC: vol.Name, Err: ctx.Err()}
 				return

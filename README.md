@@ -16,13 +16,13 @@ Labels des séries volume : `namespace`, `persistentvolumeclaim`, `persistentvol
 | `kubelet_volume_stats_inodes` | Inodes du système de fichiers entier (`statfs`), pas un quota de PVC |
 | `kubelet_volume_stats_inodes_free` | Inodes libres du système de fichiers entier (`statfs`), pas un quota de PVC |
 | `kubelet_volume_stats_inodes_used` | Entrées comptées dans le répertoire de la PVC |
-
-`inodes` et `inodes_free` sont identiques pour toutes les PVC d’un même disque : `statfs` décrit le système de fichiers qui porte le répertoire, pas la PVC. Seul `inodes_used` est compté dans le répertoire.
 | `local_path_exporter_scan_duration_seconds` | Durée du dernier cycle |
 | `local_path_exporter_scan_errors_total` | Erreurs de scan depuis le démarrage |
 | `local_path_exporter_scan_last_success_timestamp_seconds` | Unix time du dernier cycle qui a mesuré au moins une PVC, ou qui n’avait rien à mesurer |
 
-Le parcours ne suit pas les liens symboliques et ne descend pas sur un autre `st_dev`. Priorité basse : `nice` 19 et classe d’E/S idle, au mieux.
+`inodes` et `inodes_free` sont identiques pour toutes les PVC d’un même disque : `statfs` décrit le système de fichiers qui porte le répertoire, pas la PVC. Seul `inodes_used` est compté dans le répertoire.
+
+Le parcours ne suit pas les liens symboliques et ne descend pas sur un autre `st_dev`. Les entrées d’un répertoire sont lues par lots (`getdents`) et comptées au fil de l’eau : l’arborescence n’est pas accumulée. La déduplication des hardlinks ne retient que les inodes avec `nlink > 1`. La mémoire du scan ne suit donc pas le nombre de fichiers. Priorité basse : `nice` 19 et classe d’E/S idle, au mieux. Entre deux volumes, les pages inutilisées sont rendues au système.
 
 Port d’écoute : **9100** (`/metrics`, `/healthz`, `/readyz`).
 
@@ -47,7 +47,8 @@ Les quotas projet XFS ne sont pas lus (hors périmètre). Il n’y a pas d’opt
 | `METRICS_ADDR` | `:9100` | Adresse d’écoute |
 | `SCAN_INTERVAL` | `5m` | Période entre deux cycles |
 | `SCAN_TIMEOUT` | `2m` | Délai max d’un parcours de PVC |
-| `SCAN_PARALLELISM` | `2` | Parcours simultanés |
+| `SCAN_PARALLELISM` | `1` | Parcours simultanés. Un volume à la fois évite d’empiler deux pics |
+| `GOMEMLIMIT` | `100MiB` | Plafond souple du heap Go, posé par l’image et le DaemonSet, sous la limite cgroup de 128 Mio |
 
 ## Déploiement
 
@@ -65,7 +66,7 @@ Le pod est en UID 0, `allowPrivilegeEscalation: false`, rootfs en lecture seule,
 
 Image publiée sur `ghcr.io/louclaw/local-path-exporter` uniquement pour un push sur `main` (`:main`, `:sha-<commit>`) et les tags `v*` (`vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, plus le sha), via `docker/metadata-action`. linux/amd64 et linux/arm64.
 
-Le DaemonSet d’exemple épingle `v0.1.0` avec `imagePullPolicy: IfNotPresent`. Ne pas suivre le tag mouvant `:main`. Au déploiement, remplacer ce tag par le `vX.Y.Z` ou le digest réellement publié.
+Le DaemonSet d’exemple épingle `v0.1.1` avec `imagePullPolicy: IfNotPresent`. La limite mémoire reste 128 Mio ; `GOMEMLIMIT=100MiB` et `SCAN_PARALLELISM=1` tiennent le scan en dessous. Ne pas suivre le tag mouvant `:main`. Au déploiement, remplacer ce tag par le `vX.Y.Z` ou le digest réellement publié.
 
 ## Build
 
