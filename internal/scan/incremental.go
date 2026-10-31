@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +48,7 @@ type dirMem struct {
 	nfiles     int64
 	links      []linkMem
 	children   []string
+	cost       int64
 }
 
 type linkMem struct {
@@ -63,6 +63,33 @@ func NewTreeCache(maxBytes int64) *TreeCache {
 		vols:     map[string]*volumeMem{},
 		quiet:    map[string]bool{},
 	}
+}
+
+// costConsistent reports whether the running total still matches the records.
+// Tests use it to catch a missed increment on insert, replace, or eviction.
+func (c *TreeCache) costConsistent(root string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v := c.vols[root]
+	if v == nil {
+		return c.bytes >= 0
+	}
+	n := int64(volumeOverhead)
+	for rel, d := range v.dirs {
+		if d.cost != entryCost(rel, d) {
+			return false
+		}
+		n += d.cost
+	}
+	n += int64(len(v.known)) * knownLinkCost
+	if n != v.cost {
+		return false
+	}
+	var all int64
+	for _, vol := range c.vols {
+		all += vol.cost
+	}
+	return all == c.bytes
 }
 
 // Bytes is the estimated RAM held by directory records.
@@ -99,7 +126,6 @@ func (c *TreeCache) MarkFull(root string, now time.Time) {
 	v := c.ensure(root)
 	v.lastFull = now
 	v.ready = len(v.dirs) > 0 || v.ready
-	c.recompute()
 }
 
 func measureWith(ctx context.Context, root string, cache *TreeCache, full bool) (Usage, error) {
@@ -270,13 +296,15 @@ func (c *TreeCache) reset(root string) {
 	var last time.Time
 	if prev != nil {
 		last = prev.lastFull
+		c.bytes -= prev.cost
 	}
 	c.vols[root] = &volumeMem{
 		dirs:     map[string]*dirMem{},
 		known:    map[uint64]struct{}{},
 		lastFull: last,
+		cost:     volumeOverhead,
 	}
-	c.recompute()
+	c.bytes += volumeOverhead
 }
 
 func (c *TreeCache) finish(root string) {
@@ -287,8 +315,8 @@ func (c *TreeCache) finish(root string) {
 		return
 	}
 	if v.cost > c.maxBytes {
+		c.bytes -= v.cost
 		delete(c.vols, root)
-		c.recompute()
 		return
 	}
 	v.ready = true
@@ -339,32 +367,50 @@ func (c *TreeCache) store(root, rel string, d dirMem) {
 		return
 	}
 	v := c.ensure(root)
-	v.pruneChildren(rel, d.children)
+	v.pruneChildren(c, rel, d.children)
 	saved := d
 	saved.links = append([]linkMem(nil), d.links...)
 	saved.children = append([]string(nil), d.children...)
-	v.dirs[rel] = &saved
-	for _, l := range saved.links {
-		v.known[l.ino] = struct{}{}
+	saved.cost = entryCost(rel, &saved)
+	if old := v.dirs[rel]; old != nil {
+		c.adjust(v, -old.cost)
 	}
-	c.recompute()
+	v.dirs[rel] = &saved
+	c.adjust(v, saved.cost)
+	for _, l := range saved.links {
+		if _, ok := v.known[l.ino]; ok {
+			continue
+		}
+		v.known[l.ino] = struct{}{}
+		c.adjust(v, knownLinkCost)
+	}
 	if c.bytes > c.maxBytes {
+		c.bytes -= v.cost
 		delete(c.vols, root)
 		c.quiet[root] = true
-		c.recompute()
 	}
 }
 
 func (c *TreeCache) ensure(root string) *volumeMem {
 	v := c.vols[root]
 	if v == nil {
-		v = &volumeMem{dirs: map[string]*dirMem{}, known: map[uint64]struct{}{}}
+		v = &volumeMem{
+			dirs:  map[string]*dirMem{},
+			known: map[uint64]struct{}{},
+			cost:  volumeOverhead,
+		}
 		c.vols[root] = v
+		c.bytes += volumeOverhead
 	}
 	return v
 }
 
-func (v *volumeMem) pruneChildren(rel string, keep []string) {
+func (c *TreeCache) adjust(v *volumeMem, delta int64) {
+	v.cost += delta
+	c.bytes += delta
+}
+
+func (v *volumeMem) pruneChildren(c *TreeCache, rel string, keep []string) {
 	old := v.dirs[rel]
 	if old == nil {
 		return
@@ -377,42 +423,36 @@ func (v *volumeMem) pruneChildren(rel string, keep []string) {
 		if _, ok := still[name]; ok {
 			continue
 		}
-		v.deleteTree(relJoin(rel, name))
+		v.deleteTree(c, relJoin(rel, name))
 	}
 }
 
-func (v *volumeMem) deleteTree(rel string) {
-	if rel == "" {
+// deleteTree drops one cached directory and its descendants. Cost changes
+// follow the tree links, not a scan of every key in the volume.
+func (v *volumeMem) deleteTree(c *TreeCache, rel string) {
+	d := v.dirs[rel]
+	if d == nil {
 		return
 	}
-	prefix := rel + "/"
-	for k := range v.dirs {
-		if k == rel || strings.HasPrefix(k, prefix) {
-			delete(v.dirs, k)
-		}
+	kids := append([]string(nil), d.children...)
+	for _, name := range kids {
+		v.deleteTree(c, relJoin(rel, name))
 	}
+	c.adjust(v, -d.cost)
+	delete(v.dirs, rel)
 }
 
-func (c *TreeCache) recompute() {
-	var n int64
-	for _, v := range c.vols {
-		v.cost = v.size()
-		n += v.cost
-	}
-	c.bytes = n
-}
+const (
+	volumeOverhead = 96
+	knownLinkCost  = 16
+)
 
-func (v *volumeMem) size() int64 {
-	var n int64
-	n += 96
-	for rel, d := range v.dirs {
-		n += int64(len(rel)) + 64
-		n += int64(len(d.links)) * 16
-		n += int64(len(d.children)) * 16
-		for _, ch := range d.children {
-			n += int64(len(ch))
-		}
+func entryCost(rel string, d *dirMem) int64 {
+	n := int64(len(rel)) + 64
+	n += int64(len(d.links)) * 16
+	n += int64(len(d.children)) * 16
+	for _, ch := range d.children {
+		n += int64(len(ch))
 	}
-	n += int64(len(v.known)) * 16
 	return n
 }

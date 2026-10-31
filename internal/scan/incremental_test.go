@@ -117,6 +117,9 @@ func TestIncrementalAddDeleteRenameAndFull(t *testing.T) {
 	if seen.Bytes != seenPlain.Bytes || seen.Bytes <= stale.Bytes {
 		t.Fatalf("full scan = %+v plain %+v stale %+v", seen, seenPlain, stale)
 	}
+	if !cache.costConsistent(dir) {
+		t.Fatalf("cache cost drifted to %d", cache.Bytes())
+	}
 }
 
 func TestIncrementalHardlinkStaysSingle(t *testing.T) {
@@ -187,6 +190,58 @@ func TestCacheIsBounded(t *testing.T) {
 	}
 	if cache.Bytes() != 0 {
 		t.Fatalf("cache bytes = %d, want 0 when over the cap", cache.Bytes())
+	}
+}
+
+func TestFullScanManyDirectoriesWithinBound(t *testing.T) {
+	const n = 50000
+	root := t.TempDir()
+	for i := 0; i < n; i++ {
+		sub := filepath.Join(root, fmt.Sprintf("d%06d", i))
+		if err := os.Mkdir(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fd, err := os.OpenFile(filepath.Join(sub, "f"), os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fd.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache := NewTreeCache(DefaultCacheMaxBytes)
+	start := time.Now()
+	got, err := measureWith(context.Background(), root, cache, true)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("full scan of %d directories took %s, cache %d bytes", n, elapsed, cache.Bytes())
+	// 40k directories took 12.9s when every insert rescanned the cache.
+	// A linear walk of 50k is well under 5s; the CI runs this test.
+	if elapsed > 5*time.Second {
+		t.Fatalf("full scan took %s, want < 5s (quadratic cache cost)", elapsed)
+	}
+	if cache.Bytes() <= 0 || cache.Bytes() > DefaultCacheMaxBytes {
+		t.Fatalf("cache bytes = %d, want within 1..%d", cache.Bytes(), DefaultCacheMaxBytes)
+	}
+	if !cache.costConsistent(root) {
+		t.Fatalf("running cache cost %d drifted", cache.Bytes())
+	}
+	plain, err := Measure(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Bytes != plain.Bytes || got.Inodes != plain.Inodes {
+		t.Fatalf("cached %+v plain %+v", got, plain)
+	}
+	again, err := measureWith(context.Background(), root, cache, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Child directories are stated so their mtime can be checked. Their files are not.
+	if again.Bytes != got.Bytes || again.Inodes != got.Inodes || again.Entries >= got.Entries {
+		t.Fatalf("incremental %+v full %+v", again, got)
 	}
 }
 
