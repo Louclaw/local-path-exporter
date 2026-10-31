@@ -25,6 +25,11 @@ type Snapshot struct {
 	SlabReclaimable   uint64
 	SlabUnreclaimable uint64
 	Kernel            uint64
+	InactiveFile      uint64
+	// WorkingSet is memory.current minus inactive_file. It is what a
+	// near-limit alert should look at: inactive file cache is reclaimable.
+	WorkingSet      uint64
+	HasInactiveFile bool
 	// Max is 0 when the controller has no finite limit.
 	Max  uint64
 	Heap uint64
@@ -217,6 +222,7 @@ func readV2(dir string, s Snapshot) Snapshot {
 	s.SlabReclaimable = stat["slab_reclaimable"]
 	s.SlabUnreclaimable = stat["slab_unreclaimable"]
 	s.Kernel = stat["kernel"]
+	s = withWorkingSet(s, stat)
 	if maxBytes, finite := readMax(dir + "/memory.max"); finite {
 		s.Max = maxBytes
 	}
@@ -250,6 +256,21 @@ func readV1(dir string, s Snapshot) Snapshot {
 	if maxBytes, finite := readMax(dir + "/memory.limit_in_bytes"); finite {
 		s.Max = maxBytes
 	}
+	return withWorkingSet(s, stat)
+}
+
+func withWorkingSet(s Snapshot, stat map[string]uint64) Snapshot {
+	inactive, ok := stat["inactive_file"]
+	if !ok {
+		return s
+	}
+	s.HasInactiveFile = true
+	s.InactiveFile = inactive
+	if inactive >= s.Current {
+		s.WorkingSet = 0
+		return s
+	}
+	s.WorkingSet = s.Current - inactive
 	return s
 }
 

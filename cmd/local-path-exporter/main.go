@@ -207,6 +207,7 @@ func (a *application) inspect(ctx context.Context, path string) (scan.Report, er
 		"bytes", rep.Usage.Bytes,
 		"cache_bytes", a.trees.Bytes(),
 		"cgroup_current", after.Current,
+		"working_set", after.WorkingSet,
 		"delta_current", int64(after.Current) - int64(before.Current),
 		"delta_anon", int64(after.Anon) - int64(before.Anon),
 		"delta_file", int64(after.File) - int64(before.File),

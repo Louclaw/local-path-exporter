@@ -22,6 +22,7 @@ Labels des séries volume : `namespace`, `persistentvolumeclaim`, `persistentvol
 | `local_path_exporter_scan_errors_total` | Erreurs de scan depuis le démarrage |
 | `local_path_exporter_scan_last_success_timestamp_seconds` | Unix time du dernier cycle qui a mesuré au moins une PVC, ou qui n’avait rien à mesurer |
 | `local_path_exporter_cgroup_current_bytes` | `memory.current` du cgroup du processus |
+| `local_path_exporter_cgroup_working_set_bytes` | `memory.current` moins `inactive_file`. Le page cache inactif est récupérable ; le slab, lui, reste dans ce working set |
 | `local_path_exporter_cgroup_anon_bytes` | Mémoire anonyme imputée au cgroup |
 | `local_path_exporter_cgroup_file_bytes` | Page cache imputé au cgroup |
 | `local_path_exporter_cgroup_slab_reclaimable_bytes` | Slab noyau récupérable (dentries, inodes) |
@@ -35,7 +36,9 @@ Le parcours ne suit pas les liens symboliques et ne descend pas sur un autre `st
 
 Le `mtime` d’un répertoire change à la création, la suppression ou le renommage d’un nom, pas quand un fichier déjà présent est réécrit sur place (vérifié sur ext4). Le cache en mémoire réutilise alors l’ancienne taille jusqu’au prochain scan complet (`FULL_SCAN_INTERVAL`, 6 h). Rien n’est écrit sur le disque. Le cache est borné par `SCAN_CACHE_MAX_BYTES` ; au-delà, le volume est oublié et reparcouru. Un hardlink nouveau, dont l’autre nom est encore compté comme fichier simple, déclenche un scan complet du volume pour ne pas compter l’inode deux fois.
 
-`memory.reclaim` renvoie EROFS dans un pod non privilégié (k3s, containerd). Le cycle incrémental n’en a pas besoin : il ne relit pas les fichiers. Le scan complet, lui, instancie encore le slab. Sans reclaim, ce slab reste imputé au cgroup et le pod reste près de 128 Mio jusqu’à ce que le noyau le récupère pour une autre raison. L’appel à `memory.reclaim` reste une tentative, ignorée si le fichier n’est pas inscriptible.
+`memory.reclaim` renvoie EROFS dans un pod non privilégié (k3s, containerd). Le cycle incrémental n’en a pas besoin : il ne relit pas les fichiers. Le scan complet, lui, instancie encore le slab. Sans reclaim, ce slab reste imputé au cgroup et le pod reste près de 128 Mio. L’appel est tenté et ignoré s’il n’est pas inscriptible. Les répertoires sont ouverts avec `O_NOATIME` (repli sans ce flag si `EPERM`). `posix_fadvise(DONTNEED)` après lecture a été mesuré sur un million d’entrées : ni le slab, ni `memory.current`, ni le working set ne baissent. Il n’est pas utilisé.
+
+`local_path_exporter_cgroup_working_set_bytes` vaut `memory.current` moins `inactive_file`. Sur le gros volume, la prod montre un slab d’environ +100 Mio : ça reste dans le working set, donc `ContainerMemoryNearLimit` peut sonner même quand une partie du `file` est inactive.
 
 L’intervalle d’un volume est `SCAN_INTERVAL` multiplié par le nombre de pas de `SCAN_ENTRIES_PER_STEP` entrées suivies (minimum un pas), plafonné par `FULL_SCAN_INTERVAL`. `statfs` reste un seul appel.
 
@@ -64,7 +67,7 @@ Les quotas projet XFS ne sont pas lus (hors périmètre). Il n’y a pas d’opt
 | `SCAN_TIMEOUT` | `2m` | Délai max d’un parcours de PVC |
 | `SCAN_PARALLELISM` | `1` | Parcours simultanés. Un volume à la fois évite d’empiler deux pics |
 | `SCAN_ENTRIES_PER_STEP` | `50000` | Nombre d’entrées suivies pour un pas d’intervalle. L’attente est `SCAN_INTERVAL` fois le nombre de pas (minimum 1), plafonnée par `FULL_SCAN_INTERVAL`. `0` désactive l’espacement |
-| `FULL_SCAN_INTERVAL` | `6h` | Scan complet, pour voir les fichiers réécrits sans création ni suppression. `0` force un scan complet à chaque cycle |
+| `FULL_SCAN_INTERVAL` | `6h` | Scan complet, pour voir les fichiers réécrits sans création ni suppression. Entre 6 h et 24 h |
 | `SCAN_CACHE_MAX_BYTES` | `8388608` | Plafond du cache mémoire des répertoires. `0` ne garde rien |
 | `GOMEMLIMIT` | `100MiB` | Plafond souple du heap Go seulement. Le slab et le page cache sont traités par `memory.reclaim` |
 

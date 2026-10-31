@@ -61,6 +61,7 @@ spec:
             # by the full-scan period. The memory limit stays 128Mi.
             - name: SCAN_ENTRIES_PER_STEP
               value: "50000"
+            # Allowed range is 6h to 24h. In-place rewrites wait for this.
             - name: FULL_SCAN_INTERVAL
               value: 6h
             - name: SCAN_CACHE_MAX_BYTES

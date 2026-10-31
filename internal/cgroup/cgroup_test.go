@@ -71,7 +71,7 @@ func TestCollectorV2(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "memory.current", "10\n")
 	write(t, dir, "memory.max", "max\n")
-	write(t, dir, "memory.stat", "anon 1\nfile 2\nslab_reclaimable 3\nslab_unreclaimable 4\nkernel 7\n")
+	write(t, dir, "memory.stat", "anon 1\nfile 2\nslab_reclaimable 3\nslab_unreclaimable 4\ninactive_file 4\nkernel 7\n")
 	SetRootForTest(dir)
 	t.Cleanup(func() { SetRootForTest("") })
 
@@ -94,7 +94,10 @@ local_path_exporter_cgroup_slab_reclaimable_bytes 3
 # HELP local_path_exporter_cgroup_slab_unreclaimable_bytes Unreclaimable kernel slab charged to the process cgroup.
 # TYPE local_path_exporter_cgroup_slab_unreclaimable_bytes gauge
 local_path_exporter_cgroup_slab_unreclaimable_bytes 4
-`), "local_path_exporter_cgroup_anon_bytes", "local_path_exporter_cgroup_current_bytes", "local_path_exporter_cgroup_file_bytes", "local_path_exporter_cgroup_kernel_bytes", "local_path_exporter_cgroup_slab_reclaimable_bytes", "local_path_exporter_cgroup_slab_unreclaimable_bytes")
+# HELP local_path_exporter_cgroup_working_set_bytes memory.current minus inactive_file. Inactive file cache is reclaimable and is what a near-limit alert should ignore.
+# TYPE local_path_exporter_cgroup_working_set_bytes gauge
+local_path_exporter_cgroup_working_set_bytes 6
+`), "local_path_exporter_cgroup_anon_bytes", "local_path_exporter_cgroup_current_bytes", "local_path_exporter_cgroup_file_bytes", "local_path_exporter_cgroup_kernel_bytes", "local_path_exporter_cgroup_slab_reclaimable_bytes", "local_path_exporter_cgroup_slab_unreclaimable_bytes", "local_path_exporter_cgroup_working_set_bytes")
 	if err != nil {
 		t.Fatal(err)
 	}
