@@ -81,6 +81,7 @@ type Cache struct {
 	duration    float64
 	errors      float64
 	lastSuccess float64
+	entries     float64
 	scanned     bool
 	now         func() time.Time
 }
@@ -169,12 +170,28 @@ func (c *Cache) Commit(results []Result, durationSec float64) {
 	}
 }
 
+// SetEntries records how many directory entries the last cycle actually walked.
+func (c *Cache) SetEntries(n float64) {
+	c.mu.Lock()
+	c.entries = n
+	c.mu.Unlock()
+}
+
+// Previous returns the sample kept for a claim, if any.
+func (c *Cache) Previous(ns, pvc string) (Sample, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, ok := c.samples[ns+"\x00"+pvc]
+	return s, ok
+}
+
 // Snapshot is a copy of the cache for a scrape.
 type Snapshot struct {
 	Samples     []Sample
 	Duration    float64
 	Errors      float64
 	LastSuccess float64
+	Entries     float64
 	Scanned     bool
 }
 
@@ -187,6 +204,7 @@ func (c *Cache) Snapshot() Snapshot {
 		Duration:    c.duration,
 		Errors:      c.errors,
 		LastSuccess: c.lastSuccess,
+		Entries:     c.entries,
 		Scanned:     c.scanned,
 	}
 	for _, s := range c.samples {
@@ -207,6 +225,7 @@ type Collector struct {
 	duration   *prometheus.Desc
 	errors     *prometheus.Desc
 	last       *prometheus.Desc
+	entries    *prometheus.Desc
 }
 
 // NewCollector registers the kubelet volume names and the scan counters.
@@ -259,6 +278,11 @@ func NewCollector(cache *Cache) *Collector {
 			"Unix time of the last scan cycle that measured a volume or found none.",
 			nil, nil,
 		),
+		entries: prometheus.NewDesc(
+			"local_path_exporter_scan_entries",
+			"Directory entries walked during the last scan cycle. A volume skipped by the large-volume interval adds none.",
+			nil, nil,
+		),
 	}
 }
 
@@ -273,6 +297,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.duration
 	ch <- c.errors
 	ch <- c.last
+	ch <- c.entries
 }
 
 // Collect implements prometheus.Collector.
@@ -291,6 +316,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.errors, prometheus.CounterValue, snap.Errors)
 	if snap.Scanned {
 		ch <- prometheus.MustNewConstMetric(c.duration, prometheus.GaugeValue, snap.Duration)
+		ch <- prometheus.MustNewConstMetric(c.entries, prometheus.GaugeValue, snap.Entries)
 	}
 	if snap.LastSuccess > 0 {
 		ch <- prometheus.MustNewConstMetric(c.last, prometheus.GaugeValue, snap.LastSuccess)

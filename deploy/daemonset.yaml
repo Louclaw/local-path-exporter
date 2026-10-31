@@ -37,7 +37,7 @@ spec:
       containers:
         - name: exporter
           # Pin a release tag or digest. Do not track the moving :main tag.
-          image: ghcr.io/louclaw/local-path-exporter:v0.1.1
+          image: ghcr.io/louclaw/local-path-exporter:v0.1.2
           imagePullPolicy: IfNotPresent
           ports:
             - name: metrics
@@ -57,8 +57,14 @@ spec:
               value: 2m
             - name: SCAN_PARALLELISM
               value: "1"
-            # Soft heap cap under the 128Mi cgroup limit, so the GC
-            # runs before the OOM killer. The limit itself stays 128Mi.
+            # Volumes with at least this many walked entries wait longer
+            # between full walks. The memory limit stays 128Mi.
+            - name: SCAN_LARGE_ENTRIES
+              value: "100000"
+            - name: SCAN_LARGE_INTERVAL
+              value: 30m
+            # Bounds the Go heap only. Kernel slab and page cache are
+            # reclaimed via cgroup v2 memory.reclaim, under this limit.
             - name: GOMEMLIMIT
               value: "100MiB"
           securityContext:
