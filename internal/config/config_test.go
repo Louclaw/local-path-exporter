@@ -12,8 +12,9 @@ func TestFromEnvDefaults(t *testing.T) {
 	t.Setenv("SCAN_INTERVAL", "")
 	t.Setenv("SCAN_TIMEOUT", "")
 	t.Setenv("SCAN_PARALLELISM", "")
-	t.Setenv("SCAN_LARGE_ENTRIES", "")
-	t.Setenv("SCAN_LARGE_INTERVAL", "")
+	t.Setenv("SCAN_ENTRIES_PER_STEP", "")
+	t.Setenv("FULL_SCAN_INTERVAL", "")
+	t.Setenv("SCAN_CACHE_MAX_BYTES", "")
 
 	cfg, err := FromEnv()
 	if err != nil {
@@ -25,8 +26,8 @@ func TestFromEnvDefaults(t *testing.T) {
 	if cfg.ScanInterval != 5*time.Minute || cfg.ScanTimeout != 2*time.Minute || cfg.Parallelism != 1 {
 		t.Fatalf("unexpected scan defaults: %+v", cfg)
 	}
-	if cfg.LargeEntries != DefaultLargeEntries || cfg.LargeInterval != DefaultLargeInterval {
-		t.Fatalf("unexpected large-volume defaults: %+v", cfg)
+	if cfg.EntriesPerStep != DefaultEntriesPerStep || cfg.FullScan != DefaultFullScan || cfg.CacheMaxBytes != DefaultCacheMaxBytes {
+		t.Fatalf("unexpected incremental defaults: %+v", cfg)
 	}
 }
 
@@ -37,14 +38,15 @@ func TestFromEnvOverrides(t *testing.T) {
 	t.Setenv("SCAN_INTERVAL", "30s")
 	t.Setenv("SCAN_TIMEOUT", "1m")
 	t.Setenv("SCAN_PARALLELISM", "4")
-	t.Setenv("SCAN_LARGE_ENTRIES", "1000")
-	t.Setenv("SCAN_LARGE_INTERVAL", "1h")
+	t.Setenv("SCAN_ENTRIES_PER_STEP", "1000")
+	t.Setenv("FULL_SCAN_INTERVAL", "1h")
+	t.Setenv("SCAN_CACHE_MAX_BYTES", "4096")
 
 	cfg, err := FromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StoragePath != "/data" || cfg.MetricsAddr != ":8080" || cfg.ScanInterval != 30*time.Second || cfg.ScanTimeout != time.Minute || cfg.Parallelism != 4 || cfg.LargeEntries != 1000 || cfg.LargeInterval != time.Hour {
+	if cfg.StoragePath != "/data" || cfg.MetricsAddr != ":8080" || cfg.ScanInterval != 30*time.Second || cfg.ScanTimeout != time.Minute || cfg.Parallelism != 4 || cfg.EntriesPerStep != 1000 || cfg.FullScan != time.Hour || cfg.CacheMaxBytes != 4096 {
 		t.Fatalf("unexpected override: %+v", cfg)
 	}
 }
@@ -68,8 +70,8 @@ func TestFromEnvRejectsBadValues(t *testing.T) {
 		t.Fatal("expected parallelism error")
 	}
 	t.Setenv("SCAN_PARALLELISM", "1")
-	t.Setenv("SCAN_LARGE_ENTRIES", "-1")
+	t.Setenv("SCAN_ENTRIES_PER_STEP", "-1")
 	if _, err := FromEnv(); err == nil {
-		t.Fatal("expected large entries error")
+		t.Fatal("expected entries-per-step error")
 	}
 }

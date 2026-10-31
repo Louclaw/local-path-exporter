@@ -82,6 +82,7 @@ type Cache struct {
 	errors      float64
 	lastSuccess float64
 	entries     float64
+	cacheBytes  float64
 	scanned     bool
 	now         func() time.Time
 }
@@ -177,6 +178,13 @@ func (c *Cache) SetEntries(n float64) {
 	c.mu.Unlock()
 }
 
+// SetCacheBytes records the in-memory directory cache size.
+func (c *Cache) SetCacheBytes(n float64) {
+	c.mu.Lock()
+	c.cacheBytes = n
+	c.mu.Unlock()
+}
+
 // Previous returns the sample kept for a claim, if any.
 func (c *Cache) Previous(ns, pvc string) (Sample, bool) {
 	c.mu.Lock()
@@ -192,6 +200,7 @@ type Snapshot struct {
 	Errors      float64
 	LastSuccess float64
 	Entries     float64
+	CacheBytes  float64
 	Scanned     bool
 }
 
@@ -205,6 +214,7 @@ func (c *Cache) Snapshot() Snapshot {
 		Errors:      c.errors,
 		LastSuccess: c.lastSuccess,
 		Entries:     c.entries,
+		CacheBytes:  c.cacheBytes,
 		Scanned:     c.scanned,
 	}
 	for _, s := range c.samples {
@@ -226,6 +236,7 @@ type Collector struct {
 	errors     *prometheus.Desc
 	last       *prometheus.Desc
 	entries    *prometheus.Desc
+	cacheBytes *prometheus.Desc
 }
 
 // NewCollector registers the kubelet volume names and the scan counters.
@@ -280,7 +291,12 @@ func NewCollector(cache *Cache) *Collector {
 		),
 		entries: prometheus.NewDesc(
 			"local_path_exporter_scan_entries",
-			"Directory entries walked during the last scan cycle. A volume skipped by the large-volume interval adds none.",
+			"Directory entries walked during the last scan cycle. Cached directories and volumes skipped for their interval add none.",
+			nil, nil,
+		),
+		cacheBytes: prometheus.NewDesc(
+			"local_path_exporter_scan_cache_bytes",
+			"Estimated bytes of the in-memory directory cache.",
 			nil, nil,
 		),
 	}
@@ -298,6 +314,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.errors
 	ch <- c.last
 	ch <- c.entries
+	ch <- c.cacheBytes
 }
 
 // Collect implements prometheus.Collector.
@@ -317,6 +334,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	if snap.Scanned {
 		ch <- prometheus.MustNewConstMetric(c.duration, prometheus.GaugeValue, snap.Duration)
 		ch <- prometheus.MustNewConstMetric(c.entries, prometheus.GaugeValue, snap.Entries)
+		ch <- prometheus.MustNewConstMetric(c.cacheBytes, prometheus.GaugeValue, snap.CacheBytes)
 	}
 	if snap.LastSuccess > 0 {
 		ch <- prometheus.MustNewConstMetric(c.last, prometheus.GaugeValue, snap.LastSuccess)

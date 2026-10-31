@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -20,12 +21,15 @@ import (
 )
 
 // Usage is the allocated size and the number of directory entries counted.
-// Entries is every name walked, including a hard link seen again.
+// Entries is every name actually visited on this call.
+// Tracked counts names represented by the result, including directories
+// reused from the memory cache without reading them again.
 // Inodes counts each inode once.
 type Usage struct {
 	Bytes   int64
 	Inodes  int64
 	Entries int64
+	Tracked int64
 }
 
 // Report adds filesystem-wide statfs figures for the volume's device.
@@ -39,11 +43,12 @@ type Report struct {
 }
 
 type fileStat struct {
-	dev    uint64
-	ino    uint64
-	nlink  uint64
-	blocks int64
-	mode   uint32
+	dev     uint64
+	ino     uint64
+	nlink   uint64
+	blocks  int64
+	mode    uint32
+	mtimeNS int64
 }
 
 type walker interface {
@@ -69,9 +74,20 @@ func Measure(ctx context.Context, root string) (Usage, error) {
 
 // Inspect measures the directory and statfs the same path.
 func Inspect(ctx context.Context, root string) (Report, error) {
-	u, err := Measure(ctx, root)
+	return InspectWith(ctx, root, nil, time.Time{}, 0)
+}
+
+// InspectWith is Inspect with an in-memory directory cache.
+// A nil cache always walks the whole tree. fullEvery forces a full walk
+// when the previous full walk is older than that, or when it is <= 0.
+func InspectWith(ctx context.Context, root string, cache *TreeCache, now time.Time, fullEvery time.Duration) (Report, error) {
+	full := cache == nil || cache.Due(root, fullEvery, now)
+	u, err := measureWith(ctx, root, cache, full)
 	if err != nil {
-		return Report{}, err
+		return Report{}, fmt.Errorf("measure %s: %w", root, err)
+	}
+	if cache != nil && full {
+		cache.MarkFull(root, now)
 	}
 	total, avail, files, free, err := statfs(root)
 	if err != nil {
@@ -183,11 +199,12 @@ func (osWalker) lstat(path string) (fileStat, error) {
 		return fileStat{}, err
 	}
 	return fileStat{
-		dev:    uint64(st.Dev),
-		ino:    st.Ino,
-		nlink:  uint64(st.Nlink),
-		blocks: st.Blocks,
-		mode:   uint32(st.Mode),
+		dev:     uint64(st.Dev),
+		ino:     st.Ino,
+		nlink:   uint64(st.Nlink),
+		blocks:  st.Blocks,
+		mode:    uint32(st.Mode),
+		mtimeNS: int64(st.Mtim.Sec)*1_000_000_000 + int64(st.Mtim.Nsec),
 	}, nil
 }
 

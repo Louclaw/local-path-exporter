@@ -17,7 +17,8 @@ Labels des séries volume : `namespace`, `persistentvolumeclaim`, `persistentvol
 | `kubelet_volume_stats_inodes_free` | Inodes libres du système de fichiers entier (`statfs`), pas un quota de PVC |
 | `kubelet_volume_stats_inodes_used` | Entrées comptées dans le répertoire de la PVC |
 | `local_path_exporter_scan_duration_seconds` | Durée du dernier cycle |
-| `local_path_exporter_scan_entries` | Entrées de répertoire réellement parcourues pendant le dernier cycle. Un gros volume sauté par l’intervalle long compte pour zéro |
+| `local_path_exporter_scan_entries` | Entrées réellement lues pendant le dernier cycle. Un répertoire servi par le cache, ou un volume sauté, compte pour zéro |
+| `local_path_exporter_scan_cache_bytes` | Taille estimée du cache de répertoires en mémoire |
 | `local_path_exporter_scan_errors_total` | Erreurs de scan depuis le démarrage |
 | `local_path_exporter_scan_last_success_timestamp_seconds` | Unix time du dernier cycle qui a mesuré au moins une PVC, ou qui n’avait rien à mesurer |
 | `local_path_exporter_cgroup_current_bytes` | `memory.current` du cgroup du processus |
@@ -32,7 +33,11 @@ Labels des séries volume : `namespace`, `persistentvolumeclaim`, `persistentvol
 
 Le parcours ne suit pas les liens symboliques et ne descend pas sur un autre `st_dev`. Les entrées d’un répertoire sont lues par lots (`getdents`) et comptées au fil de l’eau : l’arborescence n’est pas accumulée. La déduplication des hardlinks ne retient que les inodes avec `nlink > 1`. Le heap Go reste petit. Le cgroup, lui, est aussi facturé pour le slab (dentries, inodes) et le page cache des métadonnées : `GOMEMLIMIT` ne les couvre pas. Sur un `memory.max` d’au plus 512 Mio, le parcours demande à cgroup v2 (`memory.reclaim`) de rendre du cache quand l’usage dépasse les 5/8 de la limite, jusqu’aux 9/16. À la fin du volume, un second appel redescend vers la moitié. Aller plus bas pendant le parcours relit les tables d’inodes. Priorité basse : `nice` 19 et classe d’E/S idle, au mieux. Entre deux volumes, les pages Go inutilisées sont aussi rendues au système.
 
-Le `mtime` d’un répertoire ne change pas quand un fichier existant est réécrit sur place (vérifié sur ext4). S’en servir pour sauter un sous-arbre rendrait l’usage disque faux. Ce n’est pas fait. Un volume dont le parcours précédent a vu au moins `SCAN_LARGE_ENTRIES` entrées n’est remesuré qu’une fois par `SCAN_LARGE_INTERVAL`. Les autres restent sur `SCAN_INTERVAL`. `statfs` est un seul appel, pas un second parcours.
+Le `mtime` d’un répertoire change à la création, la suppression ou le renommage d’un nom, pas quand un fichier déjà présent est réécrit sur place (vérifié sur ext4). Le cache en mémoire réutilise alors l’ancienne taille jusqu’au prochain scan complet (`FULL_SCAN_INTERVAL`, 6 h). Rien n’est écrit sur le disque. Le cache est borné par `SCAN_CACHE_MAX_BYTES` ; au-delà, le volume est oublié et reparcouru. Un hardlink nouveau, dont l’autre nom est encore compté comme fichier simple, déclenche un scan complet du volume pour ne pas compter l’inode deux fois.
+
+`memory.reclaim` renvoie EROFS dans un pod non privilégié (k3s, containerd). Le cycle incrémental n’en a pas besoin : il ne relit pas les fichiers. Le scan complet, lui, instancie encore le slab. Sans reclaim, ce slab reste imputé au cgroup et le pod reste près de 128 Mio jusqu’à ce que le noyau le récupère pour une autre raison. L’appel à `memory.reclaim` reste une tentative, ignorée si le fichier n’est pas inscriptible.
+
+L’intervalle d’un volume est `SCAN_INTERVAL` multiplié par le nombre de pas de `SCAN_ENTRIES_PER_STEP` entrées suivies (minimum un pas), plafonné par `FULL_SCAN_INTERVAL`. `statfs` reste un seul appel.
 
 Port d’écoute : **9100** (`/metrics`, `/healthz`, `/readyz`).
 
@@ -58,8 +63,9 @@ Les quotas projet XFS ne sont pas lus (hors périmètre). Il n’y a pas d’opt
 | `SCAN_INTERVAL` | `5m` | Période entre deux cycles |
 | `SCAN_TIMEOUT` | `2m` | Délai max d’un parcours de PVC |
 | `SCAN_PARALLELISM` | `1` | Parcours simultanés. Un volume à la fois évite d’empiler deux pics |
-| `SCAN_LARGE_ENTRIES` | `100000` | Au-dessus de ce nombre d’entrées, le volume passe sur l’intervalle long. `0` désactive |
-| `SCAN_LARGE_INTERVAL` | `30m` | Période minimale entre deux parcours d’un gros volume. `0` désactive |
+| `SCAN_ENTRIES_PER_STEP` | `50000` | Nombre d’entrées suivies pour un pas d’intervalle. L’attente est `SCAN_INTERVAL` fois le nombre de pas (minimum 1), plafonnée par `FULL_SCAN_INTERVAL`. `0` désactive l’espacement |
+| `FULL_SCAN_INTERVAL` | `6h` | Scan complet, pour voir les fichiers réécrits sans création ni suppression. `0` force un scan complet à chaque cycle |
+| `SCAN_CACHE_MAX_BYTES` | `8388608` | Plafond du cache mémoire des répertoires. `0` ne garde rien |
 | `GOMEMLIMIT` | `100MiB` | Plafond souple du heap Go seulement. Le slab et le page cache sont traités par `memory.reclaim` |
 
 ## Déploiement

@@ -47,6 +47,8 @@ var (
 	override   string
 
 	reclaimOnce sync.Once
+	// allowReclaim is false in measurements that simulate a read-only cgroup.
+	allowReclaim = true
 )
 
 type mount struct {
@@ -57,6 +59,12 @@ type mount struct {
 // SetRootForTest points reads and reclaim at a fake cgroup directory.
 func SetRootForTest(dir string) {
 	override = dir
+}
+
+// SetReclaimEnabled turns memory.reclaim writes on or off.
+// A non-privileged k3s pod gets EROFS from that file; measurements pass false.
+func SetReclaimEnabled(on bool) {
+	allowReclaim = on
 }
 
 // Read returns the current counters. Heap is always filled.
@@ -109,9 +117,8 @@ func relieve(force bool) {
 		return
 	}
 	// During the walk, trim once usage passes 5/8 of the limit, down to 9/16.
-	// On a 128Mi limit that is 80Mi down to 72Mi: enough to stay under the
-	// hard limit, not so deep that inode pages are dropped and reread.
-	// After the volume, force releases down to half, once.
+	// On a 128Mi limit that is 80Mi down to 72Mi. After the volume, trim to half.
+	// A non-privileged pod often gets EROFS here; the write is optional.
 	high := maxBytes * 5 / 8
 	target := maxBytes * 9 / 16
 	if force {
@@ -121,12 +128,19 @@ func relieve(force bool) {
 		return
 	}
 	want := cur - target
+	if !allowReclaim {
+		return
+	}
 	err = os.WriteFile(mnt.dir+"/memory.reclaim", []byte(strconv.FormatUint(want, 10)+"\n"), 0)
-	if err == nil || errors.Is(err, unix.EAGAIN) || errors.Is(err, os.ErrNotExist) {
+	if err == nil || errors.Is(err, unix.EAGAIN) || errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.EROFS) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		if err != nil {
+			reclaimOnce.Do(func() {
+				slog.Warn("cgroup memory.reclaim unavailable", "err", err)
+			})
+		}
 		return
 	}
 	reclaimOnce.Do(func() {
-		// Best-effort. A read-only cgroup mount leaves the walk unchanged.
 		slog.Warn("cgroup memory.reclaim", "err", err)
 	})
 }

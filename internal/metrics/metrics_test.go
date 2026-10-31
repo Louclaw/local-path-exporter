@@ -112,10 +112,13 @@ kubelet_volume_stats_inodes_used{namespace="ns",node="node-a",persistentvolume="
 # HELP kubelet_volume_stats_used_bytes Number of used bytes in the volume
 # TYPE kubelet_volume_stats_used_bytes gauge
 kubelet_volume_stats_used_bytes{namespace="ns",node="node-a",persistentvolume="pvc-1",persistentvolumeclaim="data"} 40
+# HELP local_path_exporter_scan_cache_bytes Estimated bytes of the in-memory directory cache.
+# TYPE local_path_exporter_scan_cache_bytes gauge
+local_path_exporter_scan_cache_bytes 0
 # HELP local_path_exporter_scan_duration_seconds Duration of the last scan cycle in seconds.
 # TYPE local_path_exporter_scan_duration_seconds gauge
 local_path_exporter_scan_duration_seconds 1.25
-# HELP local_path_exporter_scan_entries Directory entries walked during the last scan cycle. A volume skipped by the large-volume interval adds none.
+# HELP local_path_exporter_scan_entries Directory entries walked during the last scan cycle. Cached directories and volumes skipped for their interval add none.
 # TYPE local_path_exporter_scan_entries gauge
 local_path_exporter_scan_entries 0
 # HELP local_path_exporter_scan_errors_total Scan errors since process start. A failed volume keeps its previous sample.
