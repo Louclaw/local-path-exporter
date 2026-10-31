@@ -18,30 +18,46 @@ import (
 // InspectFunc measures one directory. The context carries the per-volume timeout.
 type InspectFunc func(ctx context.Context, path string) (scan.Report, error)
 
-// Pacer skips another full walk of a volume that was already large until
-// largeEvery has elapsed. A nil Pacer, a non-positive interval, or a
-// non-positive entry threshold scans every volume every cycle.
+// Pacer waits longer between walks of bigger volumes. The wait is
+// base * max(1, entries/perStep), capped at cap. A nil Pacer, a non-positive
+// base, or a non-positive perStep scans every volume every cycle.
 type Pacer struct {
-	mu           sync.Mutex
-	largeEntries int64
-	largeEvery   time.Duration
-	last         map[string]time.Time
-	entries      map[string]int64
+	mu      sync.Mutex
+	base    time.Duration
+	perStep int64
+	cap     time.Duration
+	last    map[string]time.Time
+	entries map[string]int64
 }
 
-// NewPacer returns a pacer. largeEntries is the inode-entry count above which
-// a volume waits largeEvery between walks.
-func NewPacer(largeEntries int64, largeEvery time.Duration) *Pacer {
+// NewPacer returns a pacer. perStep is how many tracked entries add one base interval.
+func NewPacer(base time.Duration, perStep int64, cap time.Duration) *Pacer {
 	return &Pacer{
-		largeEntries: largeEntries,
-		largeEvery:   largeEvery,
-		last:         map[string]time.Time{},
-		entries:      map[string]int64{},
+		base:    base,
+		perStep: perStep,
+		cap:     cap,
+		last:    map[string]time.Time{},
+		entries: map[string]int64{},
 	}
 }
 
+func (p *Pacer) interval(entries int64) time.Duration {
+	if p == nil || p.base <= 0 || p.perStep <= 0 {
+		return 0
+	}
+	steps := entries / p.perStep
+	if steps < 1 {
+		steps = 1
+	}
+	d := time.Duration(steps) * p.base
+	if p.cap > 0 && d > p.cap {
+		return p.cap
+	}
+	return d
+}
+
 func (p *Pacer) skip(ns, name string, now time.Time) (bool, int64, time.Duration) {
-	if p == nil || p.largeEvery <= 0 || p.largeEntries <= 0 {
+	if p == nil || p.base <= 0 || p.perStep <= 0 {
 		return false, 0, 0
 	}
 	p.mu.Lock()
@@ -49,11 +65,12 @@ func (p *Pacer) skip(ns, name string, now time.Time) (bool, int64, time.Duration
 	k := ns + "\x00" + name
 	n := p.entries[k]
 	last, ok := p.last[k]
-	if !ok || n < p.largeEntries {
+	if !ok {
 		return false, n, 0
 	}
+	wait := p.interval(n)
 	age := now.Sub(last)
-	if age >= p.largeEvery {
+	if wait <= 0 || age >= wait {
 		return false, n, age
 	}
 	return true, n, age
@@ -93,7 +110,7 @@ func RunOnce(ctx context.Context, vols []mapping.Volume, inspect InspectFunc, ca
 			if skip, n, age := pace.skip(vol.Namespace, vol.Name, time.Now()); skip {
 				if sample, ok := cache.Previous(vol.Namespace, vol.Name); ok {
 					results[i] = metrics.Result{Namespace: vol.Namespace, PVC: vol.Name, Sample: sample}
-					slog.Info("skip large volume", "path", vol.Path, "entries", n, "age", age.String())
+					slog.Info("skip volume", "path", vol.Path, "tracked", n, "age", age.String())
 					return
 				}
 			}
@@ -117,7 +134,11 @@ func RunOnce(ctx context.Context, vols []mapping.Volume, inspect InspectFunc, ca
 				return
 			}
 			traversed.Add(rep.Usage.Entries)
-			pace.observe(vol.Namespace, vol.Name, rep.Usage.Entries, time.Now())
+			tracked := rep.Usage.Tracked
+			if tracked <= 0 {
+				tracked = rep.Usage.Entries
+			}
+			pace.observe(vol.Namespace, vol.Name, tracked, time.Now())
 			capacity, emit := vol.Capacity, vol.CapacityFromPVC && vol.Capacity > 0
 			if !emit && rep.TotalBytes > 0 {
 				capacity, emit = rep.TotalBytes, true

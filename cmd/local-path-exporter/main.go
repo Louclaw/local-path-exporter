@@ -97,7 +97,8 @@ func main() {
 		pvIndex: pvInf.Informer().GetIndexer(),
 		pvcs:    pvcInf.Lister(),
 		cache:   store,
-		pace:    exporter.NewPacer(cfg.LargeEntries, cfg.LargeInterval),
+		pace:    exporter.NewPacer(cfg.ScanInterval, cfg.EntriesPerStep, cfg.FullScan),
+		trees:   scan.NewTreeCache(cfg.CacheMaxBytes),
 	}
 	app.loop(ctx, &ready)
 }
@@ -110,6 +111,7 @@ type application struct {
 	pvcs    corev1listers.PersistentVolumeClaimLister
 	cache   *metrics.Cache
 	pace    *exporter.Pacer
+	trees   *scan.TreeCache
 }
 
 func indexPVByNode(obj interface{}) ([]string, error) {
@@ -164,7 +166,8 @@ func (a *application) cycle(ctx context.Context) bool {
 	}
 	vols := mapping.Resolve(pvs, pvcs, a.cfg.NodeName, a.cfg.StoragePath, names)
 	before := a.cache.Snapshot().Errors
-	exporter.RunOnce(ctx, vols, inspect, a.cache, a.cfg.Parallelism, a.cfg.ScanTimeout, start, a.pace)
+	exporter.RunOnce(ctx, vols, a.inspect, a.cache, a.cfg.Parallelism, a.cfg.ScanTimeout, start, a.pace)
+	a.cache.SetCacheBytes(float64(a.trees.Bytes()))
 	snap := a.cache.Snapshot()
 	slog.Info("scan finished", "volumes", len(vols), "errors", snap.Errors-before, "seconds", time.Since(start).Seconds())
 	return true
@@ -186,21 +189,23 @@ func (a *application) volumesOnNode() ([]*corev1.PersistentVolume, error) {
 	return out, nil
 }
 
-func inspect(ctx context.Context, path string) (scan.Report, error) {
+func (a *application) inspect(ctx context.Context, path string) (scan.Report, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	priority.Lower()
 	before := cgroup.Read()
 	start := time.Now()
-	rep, err := scan.Inspect(ctx, path)
+	rep, err := scan.InspectWith(ctx, path, a.trees, start, a.cfg.FullScan)
 	after := cgroup.Read()
 	elapsed := time.Since(start)
 	attrs := []any{
 		"path", path,
 		"seconds", elapsed.Seconds(),
 		"entries", rep.Usage.Entries,
+		"tracked", rep.Usage.Tracked,
 		"inodes", rep.Usage.Inodes,
 		"bytes", rep.Usage.Bytes,
+		"cache_bytes", a.trees.Bytes(),
 		"cgroup_current", after.Current,
 		"delta_current", int64(after.Current) - int64(before.Current),
 		"delta_anon", int64(after.Anon) - int64(before.Anon),

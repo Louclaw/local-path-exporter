@@ -158,7 +158,7 @@ func TestPacerSkipsLargeVolume(t *testing.T) {
 		return scan.Report{Usage: scan.Usage{Bytes: 10, Inodes: 4, Entries: 100}}, nil
 	}
 	vol := mapping.Volume{Path: "/big", Namespace: "ns", Name: "big", PV: "pvc-big", Node: "n", Capacity: 100, CapacityFromPVC: true}
-	pace := NewPacer(50, time.Hour)
+	pace := NewPacer(time.Hour, 50, 0)
 	RunOnce(context.Background(), []mapping.Volume{vol}, inspect, cache, 1, time.Second, time.Now(), pace)
 	if calls.Load() != 1 || cache.Snapshot().Entries != 100 {
 		t.Fatalf("calls=%d entries=%v", calls.Load(), cache.Snapshot().Entries)
