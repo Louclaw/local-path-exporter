@@ -51,7 +51,9 @@ Les quotas projet XFS ne sont pas lus (hors périmètre). Il n’y a pas d’opt
 
 ## Déploiement
 
-Manifests d’exemple, base d’une PR GitOps séparée. Ils ne sont pas appliqués par la CI. Aligner le namespace et les labels avec les sélecteurs du Prometheus Operator. `DAC_READ_SEARCH` est requis pour `stat` des fichiers des autres UID : un namespace en Pod Security `restricted` refusera le pod. L’image est distroless, non-root (65532), rootfs en lecture seule.
+Manifests d’exemple, base d’une PR GitOps séparée. Ils ne sont pas appliqués par la CI. Aligner le namespace et les labels avec les sélecteurs du Prometheus Operator.
+
+Le pod est en UID 0, `allowPrivilegeEscalation: false`, rootfs en lecture seule, `drop: [ALL]` et seulement `DAC_READ_SEARCH`. Un UID non-root ne reçoit pas cette capability dans l’ensemble effectif quand `no_new_privs` est posé (pas de capability ambiante, et une file capability `setcap` est ignorée). En UID 0, le runtime la met dans l’ensemble effectif, ce qui suffit pour `stat` un répertoire 0700 d’un autre utilisateur. Ce n’est pas `DAC_OVERRIDE` : pas d’écriture. Une file capability sur le binaire est moins fiable (xattr perdue par le `COPY` multi-stage vers distroless, et bloquée par `allowPrivilegeEscalation: false`). Un namespace en Pod Security `restricted` refusera le pod. L’image est distroless.
 
 - `deploy/daemonset.yaml`
 - `deploy/serviceaccount.yaml`
