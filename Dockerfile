@@ -10,8 +10,10 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/local-path-exporter ./cmd/local-path-exporter
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12
 COPY --from=build --chmod=755 /out/local-path-exporter /local-path-exporter
-USER 65532:65532
+# UID 0 so the runtime puts DAC_READ_SEARCH in the effective set.
+# A non-root user plus allowPrivilegeEscalation=false never does.
+USER 0:0
 EXPOSE 9100
 ENTRYPOINT ["/local-path-exporter"]

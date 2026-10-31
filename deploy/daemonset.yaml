@@ -29,9 +29,9 @@ spec:
       tolerations:
         - operator: Exists
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-        runAsGroup: 65532
+        runAsNonRoot: false
+        runAsUser: 0
+        runAsGroup: 0
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -60,9 +60,9 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-            runAsGroup: 65532
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
             capabilities:
               drop: ["ALL"]
               add: ["DAC_READ_SEARCH"]
