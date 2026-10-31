@@ -79,8 +79,8 @@ func FromEnv() (Config, error) {
 	if cfg.EntriesPerStep < 0 {
 		return Config{}, fmt.Errorf("SCAN_ENTRIES_PER_STEP must be >= 0")
 	}
-	if cfg.FullScan < 0 {
-		return Config{}, fmt.Errorf("FULL_SCAN_INTERVAL must be >= 0")
+	if cfg.FullScan < 6*time.Hour || cfg.FullScan > 24*time.Hour {
+		return Config{}, fmt.Errorf("FULL_SCAN_INTERVAL must be between 6h and 24h")
 	}
 	if cfg.CacheMaxBytes < 0 {
 		return Config{}, fmt.Errorf("SCAN_CACHE_MAX_BYTES must be >= 0")

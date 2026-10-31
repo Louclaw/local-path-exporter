@@ -9,6 +9,7 @@ package scan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -208,8 +209,20 @@ func (osWalker) lstat(path string) (fileStat, error) {
 	}, nil
 }
 
+// openDir uses O_NOATIME so a scan does not stamp directory atime.
+// posix_fadvise(DONTNEED) was measured on a 1M-entry tree and did not lower
+// slab, memory.current, or the working set, so it is not used.
+func openDir(path string) (int, error) {
+	flags := unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	fd, err := unix.Open(path, flags|unix.O_NOATIME, 0)
+	if err == nil || !errors.Is(err, unix.EPERM) {
+		return fd, err
+	}
+	return unix.Open(path, flags, 0)
+}
+
 func (osWalker) readDir(path string, fn func(name string) error) error {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := openDir(path)
 	if err != nil {
 		return err
 	}

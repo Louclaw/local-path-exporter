@@ -39,14 +39,14 @@ func TestFromEnvOverrides(t *testing.T) {
 	t.Setenv("SCAN_TIMEOUT", "1m")
 	t.Setenv("SCAN_PARALLELISM", "4")
 	t.Setenv("SCAN_ENTRIES_PER_STEP", "1000")
-	t.Setenv("FULL_SCAN_INTERVAL", "1h")
+	t.Setenv("FULL_SCAN_INTERVAL", "12h")
 	t.Setenv("SCAN_CACHE_MAX_BYTES", "4096")
 
 	cfg, err := FromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StoragePath != "/data" || cfg.MetricsAddr != ":8080" || cfg.ScanInterval != 30*time.Second || cfg.ScanTimeout != time.Minute || cfg.Parallelism != 4 || cfg.EntriesPerStep != 1000 || cfg.FullScan != time.Hour || cfg.CacheMaxBytes != 4096 {
+	if cfg.StoragePath != "/data" || cfg.MetricsAddr != ":8080" || cfg.ScanInterval != 30*time.Second || cfg.ScanTimeout != time.Minute || cfg.Parallelism != 4 || cfg.EntriesPerStep != 1000 || cfg.FullScan != 12*time.Hour || cfg.CacheMaxBytes != 4096 {
 		t.Fatalf("unexpected override: %+v", cfg)
 	}
 }
@@ -73,5 +73,14 @@ func TestFromEnvRejectsBadValues(t *testing.T) {
 	t.Setenv("SCAN_ENTRIES_PER_STEP", "-1")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("expected entries-per-step error")
+	}
+	t.Setenv("SCAN_ENTRIES_PER_STEP", "50000")
+	t.Setenv("FULL_SCAN_INTERVAL", "1h")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("expected full scan below 6h to fail")
+	}
+	t.Setenv("FULL_SCAN_INTERVAL", "48h")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("expected full scan above 24h to fail")
 	}
 }

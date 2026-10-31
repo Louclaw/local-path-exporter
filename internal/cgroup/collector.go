@@ -4,13 +4,14 @@ import "github.com/prometheus/client_golang/prometheus"
 
 // Collector publishes cgroup memory and the Go heap on each scrape.
 type Collector struct {
-	anon    *prometheus.Desc
-	file    *prometheus.Desc
-	slabR   *prometheus.Desc
-	slabU   *prometheus.Desc
-	kernel  *prometheus.Desc
-	current *prometheus.Desc
-	heap    *prometheus.Desc
+	anon       *prometheus.Desc
+	file       *prometheus.Desc
+	slabR      *prometheus.Desc
+	slabU      *prometheus.Desc
+	kernel     *prometheus.Desc
+	current    *prometheus.Desc
+	workingSet *prometheus.Desc
+	heap       *prometheus.Desc
 }
 
 // NewCollector returns gauges with no labels. They describe the process, not a PVC.
@@ -46,6 +47,11 @@ func NewCollector() *Collector {
 			"memory.current of the process cgroup.",
 			nil, nil,
 		),
+		workingSet: prometheus.NewDesc(
+			"local_path_exporter_cgroup_working_set_bytes",
+			"memory.current minus inactive_file. Inactive file cache is reclaimable and is what a near-limit alert should ignore.",
+			nil, nil,
+		),
 		heap: prometheus.NewDesc(
 			"local_path_exporter_go_heap_bytes",
 			"Go heap bytes allocated (HeapAlloc). Independent of the cgroup kernel charges.",
@@ -62,6 +68,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.slabU
 	ch <- c.kernel
 	ch <- c.current
+	ch <- c.workingSet
 	ch <- c.heap
 }
 
@@ -78,4 +85,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.slabU, prometheus.GaugeValue, float64(s.SlabUnreclaimable))
 	ch <- prometheus.MustNewConstMetric(c.kernel, prometheus.GaugeValue, float64(s.Kernel))
 	ch <- prometheus.MustNewConstMetric(c.current, prometheus.GaugeValue, float64(s.Current))
+	if s.HasInactiveFile {
+		ch <- prometheus.MustNewConstMetric(c.workingSet, prometheus.GaugeValue, float64(s.WorkingSet))
+	}
 }
