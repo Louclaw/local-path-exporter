@@ -12,11 +12,16 @@ type Collector struct {
 	current    *prometheus.Desc
 	workingSet *prometheus.Desc
 	heap       *prometheus.Desc
+	pauses     *prometheus.Desc
+	pauseTime  *prometheus.Desc
+	throttle   *Throttle
 }
 
 // NewCollector returns gauges with no labels. They describe the process, not a PVC.
-func NewCollector() *Collector {
+// th may be nil; the throttle series are then zero.
+func NewCollector(th *Throttle) *Collector {
 	return &Collector{
+		throttle: th,
 		anon: prometheus.NewDesc(
 			"local_path_exporter_cgroup_anon_bytes",
 			"Anonymous memory charged to the process cgroup.",
@@ -57,6 +62,16 @@ func NewCollector() *Collector {
 			"Go heap bytes allocated (HeapAlloc). Independent of the cgroup kernel charges.",
 			nil, nil,
 		),
+		pauses: prometheus.NewDesc(
+			"local_path_exporter_scan_throttle_pauses_total",
+			"Backoff sleeps while a full scan waited for memory.current to fall under the throttle threshold.",
+			nil, nil,
+		),
+		pauseTime: prometheus.NewDesc(
+			"local_path_exporter_scan_throttle_pause_seconds",
+			"Seconds spent in full-scan throttle pauses since process start.",
+			nil, nil,
+		),
 	}
 }
 
@@ -70,12 +85,22 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.current
 	ch <- c.workingSet
 	ch <- c.heap
+	ch <- c.pauses
+	ch <- c.pauseTime
 }
 
 // Collect implements prometheus.Collector.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	s := Read()
 	ch <- prometheus.MustNewConstMetric(c.heap, prometheus.GaugeValue, float64(s.Heap))
+	var pauses float64
+	var paused float64
+	if c.throttle != nil {
+		pauses = float64(c.throttle.Pauses())
+		paused = c.throttle.Paused().Seconds()
+	}
+	ch <- prometheus.MustNewConstMetric(c.pauses, prometheus.CounterValue, pauses)
+	ch <- prometheus.MustNewConstMetric(c.pauseTime, prometheus.GaugeValue, paused)
 	if !s.OK {
 		return
 	}

@@ -137,6 +137,37 @@ func TestRunOnceFilesystemCapacity(t *testing.T) {
 	}
 }
 
+func TestRunOnceDeferredKeepsPrevious(t *testing.T) {
+	cache := metrics.NewCache()
+	cache.Commit([]metrics.Result{{
+		Namespace: "ns",
+		PVC:       "big",
+		Sample:    metrics.Sample{Namespace: "ns", PVC: "big", UsedBytes: 9},
+	}}, 0)
+	RunOnce(context.Background(), []mapping.Volume{{
+		Path: "/big", Namespace: "ns", Name: "big",
+	}}, func(ctx context.Context, path string) (scan.Report, error) {
+		return scan.Report{}, scan.ErrDeferred
+	}, cache, 1, time.Second, time.Now(), nil)
+	snap := cache.Snapshot()
+	if snap.Errors != 0 {
+		t.Fatalf("deferred counted as an error: %v", snap.Errors)
+	}
+	if len(snap.Samples) != 1 || snap.Samples[0].UsedBytes != 9 {
+		t.Fatalf("sample = %+v", snap.Samples)
+	}
+
+	fresh := metrics.NewCache()
+	RunOnce(context.Background(), []mapping.Volume{{
+		Path: "/new", Namespace: "ns", Name: "new",
+	}}, func(ctx context.Context, path string) (scan.Report, error) {
+		return scan.Report{}, scan.ErrDeferred
+	}, fresh, 1, time.Second, time.Now(), nil)
+	if fresh.Snapshot().Errors != 0 || len(fresh.Snapshot().Samples) != 0 {
+		t.Fatalf("deferred without a sample published zeros: %+v", fresh.Snapshot())
+	}
+}
+
 func TestRunOnceParentCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

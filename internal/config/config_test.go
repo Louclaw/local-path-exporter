@@ -15,6 +15,9 @@ func TestFromEnvDefaults(t *testing.T) {
 	t.Setenv("SCAN_ENTRIES_PER_STEP", "")
 	t.Setenv("FULL_SCAN_INTERVAL", "")
 	t.Setenv("SCAN_CACHE_MAX_BYTES", "")
+	t.Setenv("SCAN_CACHE_PATH", "")
+	t.Setenv("SCAN_THROTTLE_HIGH", "")
+	t.Setenv("SCAN_THROTTLE_BATCH", "")
 
 	cfg, err := FromEnv()
 	if err != nil {
@@ -29,6 +32,9 @@ func TestFromEnvDefaults(t *testing.T) {
 	if cfg.EntriesPerStep != DefaultEntriesPerStep || cfg.FullScan != DefaultFullScan || cfg.CacheMaxBytes != DefaultCacheMaxBytes {
 		t.Fatalf("unexpected incremental defaults: %+v", cfg)
 	}
+	if cfg.CachePath != "" || cfg.ThrottleHigh != DefaultThrottleHigh || cfg.ThrottleBatch != DefaultThrottleBatch {
+		t.Fatalf("unexpected throttle defaults: %+v", cfg)
+	}
 }
 
 func TestFromEnvOverrides(t *testing.T) {
@@ -41,6 +47,9 @@ func TestFromEnvOverrides(t *testing.T) {
 	t.Setenv("SCAN_ENTRIES_PER_STEP", "1000")
 	t.Setenv("FULL_SCAN_INTERVAL", "12h")
 	t.Setenv("SCAN_CACHE_MAX_BYTES", "4096")
+	t.Setenv("SCAN_CACHE_PATH", "/var/lib/local-path-exporter/cache.v1")
+	t.Setenv("SCAN_THROTTLE_HIGH", "0")
+	t.Setenv("SCAN_THROTTLE_BATCH", "512")
 
 	cfg, err := FromEnv()
 	if err != nil {
@@ -48,6 +57,9 @@ func TestFromEnvOverrides(t *testing.T) {
 	}
 	if cfg.StoragePath != "/data" || cfg.MetricsAddr != ":8080" || cfg.ScanInterval != 30*time.Second || cfg.ScanTimeout != time.Minute || cfg.Parallelism != 4 || cfg.EntriesPerStep != 1000 || cfg.FullScan != 12*time.Hour || cfg.CacheMaxBytes != 4096 {
 		t.Fatalf("unexpected override: %+v", cfg)
+	}
+	if cfg.CachePath != "/var/lib/local-path-exporter/cache.v1" || cfg.ThrottleHigh != 0 || cfg.ThrottleBatch != 512 {
+		t.Fatalf("unexpected throttle override: %+v", cfg)
 	}
 }
 
@@ -82,5 +94,15 @@ func TestFromEnvRejectsBadValues(t *testing.T) {
 	t.Setenv("FULL_SCAN_INTERVAL", "48h")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("expected full scan above 24h to fail")
+	}
+	t.Setenv("FULL_SCAN_INTERVAL", "6h")
+	t.Setenv("SCAN_THROTTLE_HIGH", "-1")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("expected throttle high to fail")
+	}
+	t.Setenv("SCAN_THROTTLE_HIGH", "0")
+	t.Setenv("SCAN_THROTTLE_BATCH", "-1")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("expected throttle batch to fail")
 	}
 }

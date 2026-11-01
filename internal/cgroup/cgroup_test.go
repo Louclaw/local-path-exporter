@@ -75,7 +75,7 @@ func TestCollectorV2(t *testing.T) {
 	SetRootForTest(dir)
 	t.Cleanup(func() { SetRootForTest("") })
 
-	err := testutil.CollectAndCompare(NewCollector(), strings.NewReader(`
+	err := testutil.CollectAndCompare(NewCollector(nil), strings.NewReader(`
 # HELP local_path_exporter_cgroup_anon_bytes Anonymous memory charged to the process cgroup.
 # TYPE local_path_exporter_cgroup_anon_bytes gauge
 local_path_exporter_cgroup_anon_bytes 1
@@ -102,7 +102,7 @@ local_path_exporter_cgroup_working_set_bytes 6
 		t.Fatal(err)
 	}
 	reg := prometheus.NewPedanticRegistry()
-	if err := reg.Register(NewCollector()); err != nil {
+	if err := reg.Register(NewCollector(nil)); err != nil {
 		t.Fatal(err)
 	}
 }

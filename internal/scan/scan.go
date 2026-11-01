@@ -17,8 +17,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/Louclaw/local-path-exporter/internal/cgroup"
 )
 
 // Usage is the allocated size and the number of directory entries counted.
@@ -66,6 +64,7 @@ var direntBufSize = 32 << 10
 // Measure walks root. A timeout or I/O error fails the whole walk so the
 // caller can keep the previous sample.
 func Measure(ctx context.Context, root string) (Usage, error) {
+	ctx = activateThrottle(ctx)
 	u, err := measure(ctx, osWalker{}, root)
 	if err != nil {
 		return Usage{}, fmt.Errorf("measure %s: %w", root, err)
@@ -114,7 +113,7 @@ func ChildDirs(path string) ([]string, error) {
 }
 
 func measure(ctx context.Context, w walker, root string) (Usage, error) {
-	if err := ctx.Err(); err != nil {
+	if err := budgetErr(ctx); err != nil {
 		return Usage{}, err
 	}
 	rootStat, err := w.lstat(root)
@@ -129,11 +128,11 @@ func measure(ctx context.Context, w walker, root string) (Usage, error) {
 
 	var walk func(path string, st fileStat) error
 	walk = func(path string, st fileStat) error {
-		if err := ctx.Err(); err != nil {
+		if err := budgetErr(ctx); err != nil {
 			return err
 		}
 		usage.Entries++
-		cgroup.Note(usage.Entries)
+		noteProgress(ctx, usage.Entries)
 		if st.dev != rootStat.dev {
 			return nil
 		}

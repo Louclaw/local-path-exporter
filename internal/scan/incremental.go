@@ -7,11 +7,18 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/Louclaw/local-path-exporter/internal/cgroup"
 )
 
-const DefaultCacheMaxBytes int64 = 8 << 20
+const (
+	// DefaultCacheMaxBytes is the configured cap. A value at least this large
+	// is raised to hardCacheMax so a directory-heavy volume is kept: dropping
+	// it makes every later cycle a full scan.
+	DefaultCacheMaxBytes int64 = 8 << 20
+	// hardCacheMax is the adaptive ceiling. Two large volumes (about 1.6M
+	// entries together) stay cached as directory records, still far under
+	// the 128Mi cgroup limit. The Go heap is not what fills that limit.
+	hardCacheMax int64 = 32 << 20
+)
 
 // errSurprise means a new hard link appeared in a directory that was
 // rescanned while another directory may still count that inode as a
@@ -19,7 +26,8 @@ const DefaultCacheMaxBytes int64 = 8 << 20
 var errSurprise = errors.New("hardlink cache invalidated")
 
 // TreeCache remembers per-directory sizes so an unchanged directory is not
-// read again. It is process memory only: the root filesystem is read-only.
+// read again. The copy in memory is also written to SCAN_CACHE_PATH when
+// that path is set, so a restart does not repeat the full walk.
 // Directory mtime does not change when an existing file is rewritten, so
 // those size changes wait for the next full walk.
 type TreeCache struct {
@@ -31,29 +39,26 @@ type TreeCache struct {
 }
 
 type volumeMem struct {
-	dirs     map[string]*dirMem
-	known    map[uint64]struct{}
+	root     *dirNode
 	lastFull time.Time
 	ready    bool
 	cost     int64
 }
 
-type dirMem struct {
-	mtimeNS    int64
-	selfIno    uint64
-	selfNlink  uint64
-	selfBytes  int64
-	exclBytes  int64
-	exclInodes int64
-	nfiles     int64
-	links      []linkMem
-	children   []string
-	cost       int64
-}
-
-type linkMem struct {
-	ino   uint64
-	bytes int64
+// dirNode is one directory. Direct files are a single aggregate: there is
+// no per-file record. Child names are directory names only, so a cache hit
+// does not readdir the files.
+type dirNode struct {
+	name      string
+	mtimeNS   int64
+	selfIno   uint64
+	selfNlink uint64
+	selfBytes int64
+	aggBytes  int64
+	aggInodes int64
+	nfiles    int64
+	children  []*dirNode
+	cost      int64
 }
 
 // NewTreeCache bounds the stored directories. maxBytes <= 0 disables storage.
@@ -74,14 +79,10 @@ func (c *TreeCache) costConsistent(root string) bool {
 	if v == nil {
 		return c.bytes >= 0
 	}
-	n := int64(volumeOverhead)
-	for rel, d := range v.dirs {
-		if d.cost != entryCost(rel, d) {
-			return false
-		}
-		n += d.cost
+	if !costsMatch(v.root) {
+		return false
 	}
-	n += int64(len(v.known)) * knownLinkCost
+	n := int64(volumeOverhead) + subtreeCost(v.root)
 	if n != v.cost {
 		return false
 	}
@@ -90,6 +91,32 @@ func (c *TreeCache) costConsistent(root string) bool {
 		all += vol.cost
 	}
 	return all == c.bytes
+}
+
+func costsMatch(n *dirNode) bool {
+	if n == nil {
+		return true
+	}
+	if n.cost != nodeCost(n) {
+		return false
+	}
+	for _, ch := range n.children {
+		if !costsMatch(ch) {
+			return false
+		}
+	}
+	return true
+}
+
+func subtreeCost(n *dirNode) int64 {
+	if n == nil {
+		return 0
+	}
+	s := n.cost
+	for _, ch := range n.children {
+		s += subtreeCost(ch)
+	}
+	return s
 }
 
 // Bytes is the estimated RAM held by directory records.
@@ -125,10 +152,13 @@ func (c *TreeCache) MarkFull(root string, now time.Time) {
 	defer c.mu.Unlock()
 	v := c.ensure(root)
 	v.lastFull = now
-	v.ready = len(v.dirs) > 0 || v.ready
+	v.ready = v.root != nil || v.ready
 }
 
 func measureWith(ctx context.Context, root string, cache *TreeCache, full bool) (Usage, error) {
+	if full {
+		ctx = activateThrottle(ctx)
+	}
 	if cache == nil {
 		return measure(ctx, osWalker{}, root)
 	}
@@ -141,6 +171,7 @@ func measureWith(ctx context.Context, root string, cache *TreeCache, full bool) 
 		return Usage{}, err
 	}
 	if surprise {
+		ctx = activateThrottle(ctx)
 		cache.reset(root)
 		u, _, err = walkCached(ctx, root, cache, true)
 		if err != nil {
@@ -159,51 +190,60 @@ func walkCached(ctx context.Context, root string, cache *TreeCache, full bool) (
 	}
 	seen := map[uint64]struct{}{}
 	var usage Usage
-	var walk func(path, rel string, st fileStat) error
-	walk = func(path, rel string, st fileStat) error {
-		if err := ctx.Err(); err != nil {
-			return err
+	var walk func(path, name string, st fileStat, old *dirNode) (*dirNode, error)
+	walk = func(path, name string, st fileStat, old *dirNode) (*dirNode, error) {
+		if err := budgetErr(ctx); err != nil {
+			return nil, err
 		}
 		usage.Entries++
-		cgroup.Note(usage.Entries)
+		noteProgress(ctx, usage.Entries)
 		if st.dev != rootStat.dev {
-			return nil
+			return nil, nil
 		}
-		if ent, ok := cache.load(root, rel); ok && ent.mtimeNS == st.mtimeNS {
-			applyCached(&usage, seen, ent)
-			for _, name := range ent.children {
-				if !filepath.IsLocal(name) {
+		if !full && old != nil && old.mtimeNS == st.mtimeNS {
+			applyCached(&usage, seen, old)
+			for _, ch := range old.children {
+				if ch == nil || !filepath.IsLocal(ch.name) {
 					continue
 				}
-				child := filepath.Join(path, name)
+				child := filepath.Join(path, ch.name)
 				cst, err := w.lstat(child)
 				if err != nil {
 					if os.IsNotExist(err) {
-						return errSurprise
+						return nil, errSurprise
 					}
-					return err
+					return nil, err
 				}
-				if err := walk(child, relJoin(rel, name), cst); err != nil {
-					return err
+				if _, err := walk(child, ch.name, cst, ch); err != nil {
+					return nil, err
 				}
 			}
-			return nil
+			return old, nil
 		}
-		built := dirMem{
+		oldKids := map[string]*dirNode{}
+		if old != nil {
+			for _, ch := range old.children {
+				if ch != nil {
+					oldKids[ch.name] = ch
+				}
+			}
+		}
+		n := &dirNode{
+			name:      name,
 			mtimeNS:   st.mtimeNS,
 			selfIno:   st.ino,
 			selfNlink: st.nlink,
 			selfBytes: blocksToBytes(st.blocks),
 		}
-		addNode(&usage, seen, st.ino, st.nlink, built.selfBytes)
-		err := w.readDir(path, func(name string) error {
-			if err := ctx.Err(); err != nil {
+		addNode(&usage, seen, st.ino, st.nlink, n.selfBytes)
+		err := w.readDir(path, func(cname string) error {
+			if err := budgetErr(ctx); err != nil {
 				return err
 			}
-			if !filepath.IsLocal(name) {
+			if !filepath.IsLocal(cname) {
 				return nil
 			}
-			child := filepath.Join(path, name)
+			child := filepath.Join(path, cname)
 			cst, err := w.lstat(child)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -213,56 +253,66 @@ func walkCached(ctx context.Context, root string, cache *TreeCache, full bool) (
 			}
 			if cst.dev != rootStat.dev {
 				usage.Entries++
-				cgroup.Note(usage.Entries)
+				noteProgress(ctx, usage.Entries)
 				return nil
 			}
 			if isDir(cst.mode) && !isSymlink(cst.mode) {
-				built.children = append(built.children, name)
-				return walk(child, relJoin(rel, name), cst)
+				ch, err := walk(child, cname, cst, oldKids[cname])
+				if err != nil {
+					return err
+				}
+				if ch != nil {
+					n.children = append(n.children, ch)
+				}
+				return nil
 			}
 			usage.Entries++
-			cgroup.Note(usage.Entries)
-			built.nfiles++
+			noteProgress(ctx, usage.Entries)
+			n.nfiles++
 			nbytes := blocksToBytes(cst.blocks)
 			if cst.nlink > 1 {
-				if !full && cache.ready(root) && !cache.known(root, cst.ino) {
+				// Inodes are not stored. A hard link in a directory that
+				// changed cannot be attributed without scanning the volume.
+				if !full && cache.ready(root) {
 					return errSurprise
 				}
-				built.links = append(built.links, linkMem{ino: cst.ino, bytes: nbytes})
+				if _, ok := seen[cst.ino]; ok {
+					return nil
+				}
+				n.aggBytes += nbytes
+				n.aggInodes++
 				addNode(&usage, seen, cst.ino, cst.nlink, nbytes)
 				return nil
 			}
-			built.exclBytes += nbytes
-			built.exclInodes++
+			n.aggBytes += nbytes
+			n.aggInodes++
 			usage.Bytes += nbytes
 			usage.Inodes++
 			return nil
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
-		usage.Tracked += 1 + built.nfiles
-		cache.store(root, rel, built)
-		return nil
+		usage.Tracked += 1 + n.nfiles
+		n.cost = nodeCost(n)
+		return n, nil
 	}
-	err = walk(root, "", rootStat)
+	node, err := walk(root, "", rootStat, cache.rootNode(root, full))
 	if errors.Is(err, errSurprise) {
 		return Usage{}, true, nil
 	}
 	if err != nil {
 		return Usage{}, false, err
 	}
+	cache.commit(root, node)
 	return usage, false, nil
 }
 
-func applyCached(u *Usage, seen map[uint64]struct{}, ent dirMem) {
-	addNode(u, seen, ent.selfIno, ent.selfNlink, ent.selfBytes)
-	u.Bytes += ent.exclBytes
-	u.Inodes += ent.exclInodes
-	for _, l := range ent.links {
-		addNode(u, seen, l.ino, 2, l.bytes)
-	}
-	u.Tracked += 1 + ent.nfiles
+func applyCached(u *Usage, seen map[uint64]struct{}, n *dirNode) {
+	addNode(u, seen, n.selfIno, n.selfNlink, n.selfBytes)
+	u.Bytes += n.aggBytes
+	u.Inodes += n.aggInodes
+	u.Tracked += 1 + n.nfiles
 }
 
 func addNode(u *Usage, seen map[uint64]struct{}, ino, nlink uint64, bytes int64) {
@@ -274,13 +324,6 @@ func addNode(u *Usage, seen map[uint64]struct{}, ino, nlink uint64, bytes int64)
 	}
 	u.Bytes += bytes
 	u.Inodes++
-}
-
-func relJoin(rel, name string) string {
-	if rel == "" {
-		return name
-	}
-	return rel + "/" + name
 }
 
 func (c *TreeCache) arm(root string) {
@@ -298,12 +341,7 @@ func (c *TreeCache) reset(root string) {
 		last = prev.lastFull
 		c.bytes -= prev.cost
 	}
-	c.vols[root] = &volumeMem{
-		dirs:     map[string]*dirMem{},
-		known:    map[uint64]struct{}{},
-		lastFull: last,
-		cost:     volumeOverhead,
-	}
+	c.vols[root] = &volumeMem{lastFull: last, cost: volumeOverhead}
 	c.bytes += volumeOverhead
 }
 
@@ -314,29 +352,12 @@ func (c *TreeCache) finish(root string) {
 	if v == nil || c.maxBytes <= 0 {
 		return
 	}
-	if v.cost > c.maxBytes {
+	if v.root == nil || v.cost > c.ceiling() {
 		c.bytes -= v.cost
 		delete(c.vols, root)
 		return
 	}
 	v.ready = true
-}
-
-func (c *TreeCache) load(root, rel string) (dirMem, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	v := c.vols[root]
-	if v == nil || !v.ready {
-		return dirMem{}, false
-	}
-	d := v.dirs[rel]
-	if d == nil {
-		return dirMem{}, false
-	}
-	cp := *d
-	cp.links = append([]linkMem(nil), d.links...)
-	cp.children = append([]string(nil), d.children...)
-	return cp, true
 }
 
 func (c *TreeCache) ready(root string) bool {
@@ -346,19 +367,25 @@ func (c *TreeCache) ready(root string) bool {
 	return v != nil && v.ready
 }
 
-func (c *TreeCache) known(root string, ino uint64) bool {
+// rootNode is the cached tree for an incremental walk.
+// A full walk starts empty so every directory is rebuilt.
+func (c *TreeCache) rootNode(root string, full bool) *dirNode {
+	if c == nil || full {
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	v := c.vols[root]
-	if v == nil {
-		return false
+	if v == nil || !v.ready {
+		return nil
 	}
-	_, ok := v.known[ino]
-	return ok
+	return v.root
 }
 
-func (c *TreeCache) store(root, rel string, d dirMem) {
-	if c == nil || c.maxBytes <= 0 {
+// commit swaps in the tree built by one walk. Cost is the sum of the node
+// records, computed once: a per-directory rescan of the whole map was quadratic.
+func (c *TreeCache) commit(root string, n *dirNode) {
+	if c == nil || c.maxBytes <= 0 || n == nil {
 		return
 	}
 	c.mu.Lock()
@@ -367,92 +394,51 @@ func (c *TreeCache) store(root, rel string, d dirMem) {
 		return
 	}
 	v := c.ensure(root)
-	v.pruneChildren(c, rel, d.children)
-	saved := d
-	saved.links = append([]linkMem(nil), d.links...)
-	saved.children = append([]string(nil), d.children...)
-	saved.cost = entryCost(rel, &saved)
-	if old := v.dirs[rel]; old != nil {
-		c.adjust(v, -old.cost)
-	}
-	v.dirs[rel] = &saved
-	c.adjust(v, saved.cost)
-	for _, l := range saved.links {
-		if _, ok := v.known[l.ino]; ok {
-			continue
-		}
-		v.known[l.ino] = struct{}{}
-		c.adjust(v, knownLinkCost)
-	}
-	if c.bytes > c.maxBytes {
+	cost := int64(volumeOverhead) + subtreeCost(n)
+	if cost > c.ceiling() || c.bytes-v.cost+cost > c.ceiling() {
 		c.bytes -= v.cost
 		delete(c.vols, root)
 		c.quiet[root] = true
+		return
 	}
+	c.bytes += cost - v.cost
+	v.root = n
+	v.cost = cost
+}
+
+// ceiling is the configured cap. At or above the default it grows to
+// hardCacheMax so a volume larger than 8MiB is not discarded.
+func (c *TreeCache) ceiling() int64 {
+	if c == nil || c.maxBytes <= 0 {
+		return 0
+	}
+	if c.maxBytes < DefaultCacheMaxBytes {
+		return c.maxBytes
+	}
+	if c.maxBytes >= hardCacheMax {
+		return c.maxBytes
+	}
+	return hardCacheMax
 }
 
 func (c *TreeCache) ensure(root string) *volumeMem {
 	v := c.vols[root]
 	if v == nil {
-		v = &volumeMem{
-			dirs:  map[string]*dirMem{},
-			known: map[uint64]struct{}{},
-			cost:  volumeOverhead,
-		}
+		v = &volumeMem{cost: volumeOverhead}
 		c.vols[root] = v
 		c.bytes += volumeOverhead
 	}
 	return v
 }
 
-func (c *TreeCache) adjust(v *volumeMem, delta int64) {
-	v.cost += delta
-	c.bytes += delta
-}
+const volumeOverhead = 96
 
-func (v *volumeMem) pruneChildren(c *TreeCache, rel string, keep []string) {
-	old := v.dirs[rel]
-	if old == nil {
-		return
+func nodeCost(n *dirNode) int64 {
+	if n == nil {
+		return 0
 	}
-	still := map[string]struct{}{}
-	for _, name := range keep {
-		still[name] = struct{}{}
-	}
-	for _, name := range old.children {
-		if _, ok := still[name]; ok {
-			continue
-		}
-		v.deleteTree(c, relJoin(rel, name))
-	}
-}
-
-// deleteTree drops one cached directory and its descendants. Cost changes
-// follow the tree links, not a scan of every key in the volume.
-func (v *volumeMem) deleteTree(c *TreeCache, rel string) {
-	d := v.dirs[rel]
-	if d == nil {
-		return
-	}
-	kids := append([]string(nil), d.children...)
-	for _, name := range kids {
-		v.deleteTree(c, relJoin(rel, name))
-	}
-	c.adjust(v, -d.cost)
-	delete(v.dirs, rel)
-}
-
-const (
-	volumeOverhead = 96
-	knownLinkCost  = 16
-)
-
-func entryCost(rel string, d *dirMem) int64 {
-	n := int64(len(rel)) + 64
-	n += int64(len(d.links)) * 16
-	n += int64(len(d.children)) * 16
-	for _, ch := range d.children {
-		n += int64(len(ch))
-	}
-	return n
+	// 120 bytes covers the node, its pointer in the parent, and allocator
+	// overhead. On a tree of 100k directories and 1M entries this tracks
+	// the retained heap, so the 32MiB ceiling is a real-memory ceiling.
+	return int64(len(n.name)) + 120
 }
