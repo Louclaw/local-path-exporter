@@ -113,7 +113,7 @@ func budgetErr(ctx context.Context) error {
 type throttleKey struct{}
 type throttleActiveKey struct{}
 
-// WithThrottle attaches a throttler. It sleeps only during a full walk.
+// WithThrottle attaches a throttler. It sleeps on every walk, full or incremental.
 func WithThrottle(ctx context.Context, t *cgroup.Throttle) context.Context {
 	if t == nil {
 		return ctx

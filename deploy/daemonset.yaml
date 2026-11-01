@@ -38,7 +38,7 @@ spec:
       containers:
         - name: exporter
           # Pin a release tag or digest. Do not track the moving :main tag.
-          image: ghcr.io/louclaw/local-path-exporter:v0.1.4
+          image: ghcr.io/louclaw/local-path-exporter:v0.1.5
           imagePullPolicy: IfNotPresent
           ports:
             - name: metrics

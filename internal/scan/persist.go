@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const cacheFileVersion uint32 = 2
@@ -44,6 +46,9 @@ func (c *TreeCache) Save(path string) error {
 	if err := tmp.Sync(); err != nil {
 		return err
 	}
+	// The bytes are durable. Drop them from the page cache so the write is
+	// not charged to the cgroup after the rename.
+	_ = unix.Fadvise(int(tmp.Fd()), 0, 0, unix.FADV_DONTNEED)
 	if err := tmp.Close(); err != nil {
 		return err
 	}
@@ -54,6 +59,10 @@ func (c *TreeCache) Save(path string) error {
 	if dirf, err := os.Open(dir); err == nil {
 		_ = dirf.Sync()
 		dirf.Close()
+	}
+	if f, err := os.Open(path); err == nil {
+		_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+		f.Close()
 	}
 	return nil
 }
@@ -73,7 +82,14 @@ func (c *TreeCache) Load(path string) error {
 		return err
 	}
 	defer f.Close()
-	vols, bytes, err := readCache(f)
+	if st, err := f.Stat(); err == nil && st.Size() > hardCacheMax*2 {
+		return errors.New("cache file too large")
+	}
+	// A cache near the 32MiB ceiling must not stay in the page cache: those
+	// pages are charged to the cgroup on top of the decoded tree.
+	r := &droppingReader{f: f}
+	vols, bytes, err := readCache(r)
+	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
 	if err != nil {
 		return err
 	}
@@ -82,6 +98,26 @@ func (c *TreeCache) Load(path string) error {
 	c.vols = vols
 	c.bytes = bytes
 	return nil
+}
+
+// droppingReader forgets file pages as they are consumed so the page cache
+// does not hold a second copy of the cache for the whole decode.
+type droppingReader struct {
+	f    *os.File
+	off  int64
+	drop int64
+}
+
+func (r *droppingReader) Read(p []byte) (int, error) {
+	n, err := r.f.Read(p)
+	if n > 0 {
+		r.off += int64(n)
+		if r.off-r.drop >= 1<<20 {
+			_ = unix.Fadvise(int(r.f.Fd()), 0, r.off, unix.FADV_DONTNEED)
+			r.drop = r.off
+		}
+	}
+	return n, err
 }
 
 func writeCache(w io.Writer, c *TreeCache) error {
