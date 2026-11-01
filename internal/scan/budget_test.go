@@ -57,7 +57,7 @@ func TestBudgetParentCancel(t *testing.T) {
 	}
 }
 
-func TestIncrementalDoesNotThrottle(t *testing.T) {
+func TestIncrementalAlsoThrottles(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -80,7 +80,7 @@ func TestIncrementalDoesNotThrottle(t *testing.T) {
 	if _, err := InspectWith(ctx, root, cache, time.Now(), time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if checks != 0 {
-		t.Fatalf("incremental scan consulted the throttler %d times", checks)
+	if checks == 0 {
+		t.Fatal("incremental scan did not consult the throttler")
 	}
 }

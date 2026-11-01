@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -85,6 +87,95 @@ func TestPersistRejectsBadVersion(t *testing.T) {
 	}
 	if cache.Bytes() != kept {
 		t.Fatalf("failed load changed the cache: %d -> %d", kept, cache.Bytes())
+	}
+}
+
+func TestLoadLargeCacheHeapIsBounded(t *testing.T) {
+	src := NewTreeCache(DefaultCacheMaxBytes)
+	src.commit("/vol", wideTree(30000, 160))
+	src.finish("/vol")
+	if src.Bytes() < 4<<20 {
+		t.Fatalf("fixture cache = %d, want a multi-megabyte tree", src.Bytes())
+	}
+	path := filepath.Join(t.TempDir(), "cache.v1")
+	if err := src.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	var peak atomic.Uint64
+	stop := make(chan struct{})
+	go func() {
+		var m runtime.MemStats
+		tick := time.NewTicker(2 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				runtime.ReadMemStats(&m)
+				for {
+					old := peak.Load()
+					if m.HeapAlloc <= old || peak.CompareAndSwap(old, m.HeapAlloc) {
+						break
+					}
+				}
+			}
+		}
+	}()
+	dst := NewTreeCache(DefaultCacheMaxBytes)
+	if err := dst.Load(path); err != nil {
+		t.Fatal(err)
+	}
+	close(stop)
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	retained := after.HeapAlloc - before.HeapAlloc
+	// The decoded tree is one copy. A second full copy of the file, or of
+	// every string, would push the retained heap well past the estimate.
+	if retained > uint64(dst.Bytes())+8<<20 {
+		t.Fatalf("retained heap %d, cache %d, file %d", retained, dst.Bytes(), st.Size())
+	}
+	got := peak.Load()
+	allow := uint64(dst.Bytes())*2 + 8<<20
+	if got > before.HeapAlloc+allow {
+		t.Fatalf("peak heap %d, base %d, allowance %d, file %d", got, before.HeapAlloc, allow, st.Size())
+	}
+	t.Logf("file=%d cache=%d retained=%d peak_over_base=%d", st.Size(), dst.Bytes(), retained, got-before.HeapAlloc)
+
+	again, err := InspectWith(context.Background(), t.TempDir(), dst, time.Now(), 6*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Usage.Entries < 1 {
+		t.Fatal("loaded cache broke scanning")
+	}
+}
+
+func TestLoadRejectsOversizedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.v1")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(hardCacheMax*2 + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cache := NewTreeCache(DefaultCacheMaxBytes)
+	if err := cache.Load(path); err == nil {
+		t.Fatal("expected oversized cache to be rejected")
+	}
+	if cache.Bytes() != 0 {
+		t.Fatalf("rejected load changed the cache: %d", cache.Bytes())
 	}
 }
 

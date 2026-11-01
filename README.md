@@ -19,6 +19,7 @@ Labels des séries volume : `namespace`, `persistentvolumeclaim`, `persistentvol
 | `local_path_exporter_scan_duration_seconds` | Durée du dernier cycle |
 | `local_path_exporter_scan_entries` | Entrées réellement lues pendant le dernier cycle. Un répertoire servi par le cache, ou un volume sauté, compte pour zéro |
 | `local_path_exporter_scan_cache_bytes` | Taille estimée du cache de répertoires en mémoire |
+| `local_path_exporter_scan_load_current_bytes` | `memory.current` juste après le chargement du cache persisté |
 | `local_path_exporter_scan_throttle_pauses_total` | Pauses du scan complet pendant que `memory.current` dépassait le seuil |
 | `local_path_exporter_scan_throttle_pause_seconds` | Secondes passées dans ces pauses depuis le démarrage du processus |
 | `local_path_exporter_scan_errors_total` | Erreurs de scan depuis le démarrage. Un scan complet reporté au cycle suivant n’en est pas une |
@@ -44,7 +45,9 @@ Ce cache est aussi écrit dans `SCAN_CACHE_PATH` (un fichier sur l’`emptyDir`,
 
 `memory.high` vaut `max` dans le cgroup que pose le kubelet. Le noyau ne réclame donc pas tant que `memory.current` n’a pas atteint `memory.max`, et une pause en dessous du plafond ne fait pas baisser le slab. La charge qui pousse au plafond est le slab récupérable (dentries et inodes, de l’ordre de 1,3 Mio pour 1 000 fichiers), pas le heap Go : anon reste autour de quelques Mio. L’OOM en production est la course entre cette allocation et la réclamation directe au plafond. Découper un seul volume en morceaux ne suffit pas : le slab s’accumule d’un morceau à l’autre tant que le processus et le cgroup vivent.
 
-Le scan complet lit `memory.current` tous les `SCAN_THROTTLE_BATCH` entrées (défaut 2048, environ 2 à 3 Mio de slab). Tant que la valeur dépasse `SCAN_THROTTLE_HIGH` (défaut 100 Mio), il attend, backoff de 20 ms doublé jusqu’à 200 ms, au plus 500 ms par lot. Ça laisse la réclamation au plafond rattraper le rythme, sans monter la limite de 128 Mio. Ces pauses sont volontaires : elles repoussent l’échéance de `SCAN_TIMEOUT`, qui continue de couvrir le temps de parcours. `0` sur l’un des deux réglages désactive le throttling. Le cycle incrémental ne s’arrête pas. `memory.reclaim` reste tenté et ignoré s’il renvoie EROFS, ce qui est le cas d’un pod non privilégié.
+Chaque parcours, complet ou incrémental, lit `memory.current` tous les `SCAN_THROTTLE_BATCH` entrées (défaut 2048). Tant que la valeur dépasse `SCAN_THROTTLE_HIGH` (défaut 100 Mio), il attend, backoff de 20 ms doublé jusqu’à 200 ms, au plus 500 ms par lot. L’incrémental d’un gros volume lit encore tous les répertoires : sans cette pause, le slab remonte jusqu’au plafond après un redémarrage, quand tous les volumes sont reparcourus d’affilée. Ces pauses sont volontaires : elles repoussent l’échéance de `SCAN_TIMEOUT`. `0` sur l’un des deux réglages désactive le throttling. `memory.reclaim` reste tenté et ignoré s’il renvoie EROFS.
+
+Le fichier de cache est lu et écrit au fil de l’eau. Après lecture, et après le `fsync` de l’écriture, `posix_fadvise(DONTNEED)` retire ses pages du page cache : elles sont facturées au cgroup et s’ajoutent au heap du cache décodé. Un fichier trop gros, tronqué ou illisible est supprimé. Le processus continue avec un cache vide au lieu de reboucler dessus. `local_path_exporter_scan_load_current_bytes` est `memory.current` juste après ce chargement.
 
 Un cycle ne lance qu’un scan complet. Les autres volumes qui en auraient besoin attendent le cycle suivant, gardent leur échantillon précédent, et n’incrémentent pas `local_path_exporter_scan_errors_total`. Deux gros volumes (immich et nullclaw) ne sont donc plus parcourus l’un derrière l’autre au démarrage.
 
@@ -100,7 +103,7 @@ Le pod est en UID 0, `allowPrivilegeEscalation: false`, rootfs en lecture seule,
 
 Image publiée sur `ghcr.io/louclaw/local-path-exporter` uniquement pour un push sur `main` (`:main`, `:sha-<commit>`) et les tags `v*` (`vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, plus le sha), via `docker/metadata-action`. linux/amd64 et linux/arm64.
 
-Le DaemonSet d’exemple épingle `v0.1.4` avec `imagePullPolicy: IfNotPresent`. La limite mémoire reste 128 Mio. Aucune capability n’est ajoutée. Ne pas suivre le tag mouvant `:main`. Au déploiement, remplacer ce tag par le `vX.Y.Z` ou le digest réellement publié.
+Le DaemonSet d’exemple épingle `v0.1.5` avec `imagePullPolicy: IfNotPresent`. La limite mémoire reste 128 Mio. Aucune capability n’est ajoutée. Ne pas suivre le tag mouvant `:main`. Au déploiement, remplacer ce tag par le `vX.Y.Z` ou le digest réellement publié.
 
 Chaque volume écrit une ligne `scan volume` : durée, entrées, `full`, pauses, inodes, octets, `cgroup_current`, et les deltas anon, file, slab, kernel, heap. Une ligne `defer full scan` marque un volume reporté. Après déploiement, sur le nœud chargé : le premier cycle ne doit pas finir en `OOMKilled` ; `local_path_exporter_scan_throttle_pauses_total` augmente pendant le gros volume ; un redémarrage du pod doit logger un cache rechargé et un `entries` très petit sur ce volume. `memory.current` peut rester proche de 128 Mio après le scan complet, parce que le slab n’est pas rendu tant que le cgroup n’est pas au plafond. `memory.reclaim` n’existe qu’en cgroup v2 (noyau 5.19 ou plus récent) et renvoie souvent EROFS dans le pod : les gauges restent lisibles.
 

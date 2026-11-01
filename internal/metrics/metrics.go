@@ -85,6 +85,8 @@ type Cache struct {
 	lastSuccess float64
 	entries     float64
 	cacheBytes  float64
+	loadCurrent float64
+	loadSeen    bool
 	scanned     bool
 	now         func() time.Time
 }
@@ -202,6 +204,14 @@ func (c *Cache) SetCacheBytes(n float64) {
 	c.mu.Unlock()
 }
 
+// SetLoadCurrent records memory.current just after the directory cache was loaded.
+func (c *Cache) SetLoadCurrent(n float64) {
+	c.mu.Lock()
+	c.loadCurrent = n
+	c.loadSeen = true
+	c.mu.Unlock()
+}
+
 // Previous returns the sample kept for a claim, if any.
 func (c *Cache) Previous(ns, pvc string) (Sample, bool) {
 	c.mu.Lock()
@@ -218,6 +228,8 @@ type Snapshot struct {
 	LastSuccess float64
 	Entries     float64
 	CacheBytes  float64
+	LoadCurrent float64
+	LoadSeen    bool
 	Scanned     bool
 }
 
@@ -232,6 +244,8 @@ func (c *Cache) Snapshot() Snapshot {
 		LastSuccess: c.lastSuccess,
 		Entries:     c.entries,
 		CacheBytes:  c.cacheBytes,
+		LoadCurrent: c.loadCurrent,
+		LoadSeen:    c.loadSeen,
 		Scanned:     c.scanned,
 	}
 	for _, s := range c.samples {
@@ -242,18 +256,19 @@ func (c *Cache) Snapshot() Snapshot {
 
 // Collector emits volume gauges from the cache on each scrape.
 type Collector struct {
-	cache      *Cache
-	used       *prometheus.Desc
-	capacity   *prometheus.Desc
-	available  *prometheus.Desc
-	inodes     *prometheus.Desc
-	inodesFree *prometheus.Desc
-	inodesUsed *prometheus.Desc
-	duration   *prometheus.Desc
-	errors     *prometheus.Desc
-	last       *prometheus.Desc
-	entries    *prometheus.Desc
-	cacheBytes *prometheus.Desc
+	cache       *Cache
+	used        *prometheus.Desc
+	capacity    *prometheus.Desc
+	available   *prometheus.Desc
+	inodes      *prometheus.Desc
+	inodesFree  *prometheus.Desc
+	inodesUsed  *prometheus.Desc
+	duration    *prometheus.Desc
+	errors      *prometheus.Desc
+	last        *prometheus.Desc
+	entries     *prometheus.Desc
+	cacheBytes  *prometheus.Desc
+	loadCurrent *prometheus.Desc
 }
 
 // NewCollector registers the kubelet volume names and the scan counters.
@@ -316,6 +331,11 @@ func NewCollector(cache *Cache) *Collector {
 			"Estimated bytes of the in-memory directory cache.",
 			nil, nil,
 		),
+		loadCurrent: prometheus.NewDesc(
+			"local_path_exporter_scan_load_current_bytes",
+			"memory.current immediately after loading the persisted directory cache. Zero when the cgroup could not be read.",
+			nil, nil,
+		),
 	}
 }
 
@@ -332,6 +352,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.last
 	ch <- c.entries
 	ch <- c.cacheBytes
+	ch <- c.loadCurrent
 }
 
 // Collect implements prometheus.Collector.
@@ -352,6 +373,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.duration, prometheus.GaugeValue, snap.Duration)
 		ch <- prometheus.MustNewConstMetric(c.entries, prometheus.GaugeValue, snap.Entries)
 		ch <- prometheus.MustNewConstMetric(c.cacheBytes, prometheus.GaugeValue, snap.CacheBytes)
+	}
+	if snap.LoadSeen {
+		ch <- prometheus.MustNewConstMetric(c.loadCurrent, prometheus.GaugeValue, snap.LoadCurrent)
 	}
 	if snap.LastSuccess > 0 {
 		ch <- prometheus.MustNewConstMetric(c.last, prometheus.GaugeValue, snap.LastSuccess)

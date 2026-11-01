@@ -156,9 +156,10 @@ func (c *TreeCache) MarkFull(root string, now time.Time) {
 }
 
 func measureWith(ctx context.Context, root string, cache *TreeCache, full bool) (Usage, error) {
-	if full {
-		ctx = activateThrottle(ctx)
-	}
+	// Incremental walks lstat every cached directory. On a large volume that
+	// is enough slab to pin a 128Mi cgroup, so the throttle applies to every
+	// walk, not only the full one.
+	ctx = activateThrottle(ctx)
 	if cache == nil {
 		return measure(ctx, osWalker{}, root)
 	}

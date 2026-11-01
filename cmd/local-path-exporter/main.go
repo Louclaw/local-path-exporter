@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -95,10 +96,21 @@ func main() {
 
 	trees := scan.NewTreeCache(cfg.CacheMaxBytes)
 	if err := trees.Load(cfg.CachePath); err != nil {
+		// A bad file must not be retried on the next restart: that is the crashloop.
 		slog.Warn("load cache", "path", cfg.CachePath, "err", err)
+		if cfg.CachePath != "" {
+			if rmErr := os.Remove(cfg.CachePath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				slog.Warn("remove cache", "path", cfg.CachePath, "err", rmErr)
+			}
+		}
 	} else if cfg.CachePath != "" {
 		slog.Info("cache loaded", "path", cfg.CachePath, "bytes", trees.Bytes())
 	}
+	runtime.GC()
+	debug.FreeOSMemory()
+	loaded := cgroup.Read()
+	store.SetLoadCurrent(float64(loaded.Current))
+	slog.Info("cache load memory", "cgroup_current", loaded.Current, "heap", loaded.Heap, "cache_bytes", trees.Bytes())
 	app := &application{
 		cfg:      cfg,
 		pvIndex:  pvInf.Informer().GetIndexer(),
