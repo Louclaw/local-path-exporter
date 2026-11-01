@@ -38,7 +38,7 @@ spec:
       containers:
         - name: exporter
           # Pin a release tag or digest. Do not track the moving :main tag.
-          image: ghcr.io/louclaw/local-path-exporter:v0.1.5
+          image: ghcr.io/louclaw/local-path-exporter:v0.1.6
           imagePullPolicy: IfNotPresent
           ports:
             - name: metrics
@@ -78,6 +78,10 @@ spec:
               value: "104857600"
             - name: SCAN_THROTTLE_BATCH
               value: "2048"
+            # Hard cap on every walk, including incrementals still under 100Mi.
+            # 0 disables. The memory threshold alone does not see those bursts.
+            - name: SCAN_MAX_ENTRIES_PER_SEC
+              value: "4000"
             # Bounds the Go heap only. Kernel slab is what approaches 128Mi.
             - name: GOMEMLIMIT
               value: "100MiB"

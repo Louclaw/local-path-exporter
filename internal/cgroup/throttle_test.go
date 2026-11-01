@@ -30,6 +30,26 @@ func TestThrottleBackoffIsBounded(t *testing.T) {
 	}
 }
 
+func TestRateLimitIndependentOfMemory(t *testing.T) {
+	th := NewThrottle(1<<30, 100)
+	th.MaxPerSec = 500
+	th.SetCurrentForTest(func() (uint64, bool) { return 1, true })
+	start := time.Now()
+	for e := int64(100); e <= 1000; e += 100 {
+		th.Check(context.Background(), e, nil)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 1500*time.Millisecond {
+		t.Fatalf("rate cap did not slow the walk: %s pauses=%d", elapsed, th.Pauses())
+	}
+	if elapsed > 6*time.Second {
+		t.Fatalf("rate cap slept too long: %s", elapsed)
+	}
+	if th.Pauses() < 1 {
+		t.Fatal("expected a rate-limit pause under the memory threshold")
+	}
+}
+
 func TestThrottleStopsWhenUnder(t *testing.T) {
 	th := NewThrottle(100, 10)
 	th.SetCurrentForTest(func() (uint64, bool) { return 10, true })
