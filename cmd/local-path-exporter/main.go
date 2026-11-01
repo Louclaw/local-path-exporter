@@ -48,7 +48,8 @@ func main() {
 	store := metrics.NewCache()
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(metrics.NewCollector(store))
-	reg.MustRegister(cgroup.NewCollector())
+	throttle := cgroup.NewThrottle(uint64(cfg.ThrottleHigh), cfg.ThrottleBatch)
+	reg.MustRegister(cgroup.NewCollector(throttle))
 
 	var ready atomic.Bool
 	srv := &http.Server{
@@ -92,13 +93,20 @@ func main() {
 		}
 	}
 
+	trees := scan.NewTreeCache(cfg.CacheMaxBytes)
+	if err := trees.Load(cfg.CachePath); err != nil {
+		slog.Warn("load cache", "path", cfg.CachePath, "err", err)
+	} else if cfg.CachePath != "" {
+		slog.Info("cache loaded", "path", cfg.CachePath, "bytes", trees.Bytes())
+	}
 	app := &application{
-		cfg:     cfg,
-		pvIndex: pvInf.Informer().GetIndexer(),
-		pvcs:    pvcInf.Lister(),
-		cache:   store,
-		pace:    exporter.NewPacer(cfg.ScanInterval, cfg.EntriesPerStep, cfg.FullScan),
-		trees:   scan.NewTreeCache(cfg.CacheMaxBytes),
+		cfg:      cfg,
+		pvIndex:  pvInf.Informer().GetIndexer(),
+		pvcs:     pvcInf.Lister(),
+		cache:    store,
+		pace:     exporter.NewPacer(cfg.ScanInterval, cfg.EntriesPerStep, cfg.FullScan),
+		trees:    trees,
+		throttle: throttle,
 	}
 	app.loop(ctx, &ready)
 }
@@ -106,12 +114,14 @@ func main() {
 const pvNodeIndex = "node"
 
 type application struct {
-	cfg     config.Config
-	pvIndex toolcache.Indexer
-	pvcs    corev1listers.PersistentVolumeClaimLister
-	cache   *metrics.Cache
-	pace    *exporter.Pacer
-	trees   *scan.TreeCache
+	cfg      config.Config
+	pvIndex  toolcache.Indexer
+	pvcs     corev1listers.PersistentVolumeClaimLister
+	cache    *metrics.Cache
+	pace     *exporter.Pacer
+	trees    *scan.TreeCache
+	throttle *cgroup.Throttle
+	gate     scan.Gate
 }
 
 func indexPVByNode(obj interface{}) ([]string, error) {
@@ -165,8 +175,12 @@ func (a *application) cycle(ctx context.Context) bool {
 		return false
 	}
 	vols := mapping.Resolve(pvs, pvcs, a.cfg.NodeName, a.cfg.StoragePath, names)
+	a.arm(vols, start)
 	before := a.cache.Snapshot().Errors
 	exporter.RunOnce(ctx, vols, a.inspect, a.cache, a.cfg.Parallelism, a.cfg.ScanTimeout, start, a.pace)
+	if err := a.trees.Save(a.cfg.CachePath); err != nil {
+		slog.Warn("save cache", "path", a.cfg.CachePath, "err", err)
+	}
 	a.cache.SetCacheBytes(float64(a.trees.Bytes()))
 	snap := a.cache.Snapshot()
 	slog.Info("scan finished", "volumes", len(vols), "errors", snap.Errors-before, "seconds", time.Since(start).Seconds())
@@ -189,19 +203,54 @@ func (a *application) volumesOnNode() ([]*corev1.PersistentVolume, error) {
 	return out, nil
 }
 
+// arm picks the single volume allowed to run a full walk this cycle.
+// Incremental walks are not limited. A second full walk waits for the next cycle
+// so two large trees are not charged back to back.
+func (a *application) arm(vols []mapping.Volume, now time.Time) {
+	picked := ""
+	for _, vol := range vols {
+		if a.pace != nil && a.pace.Skipping(vol.Namespace, vol.Name, now) {
+			if _, ok := a.cache.Previous(vol.Namespace, vol.Name); ok {
+				continue
+			}
+		}
+		if a.trees != nil && !a.trees.Due(vol.Path, a.cfg.FullScan, now) {
+			continue
+		}
+		picked = vol.Path
+		break
+	}
+	a.gate.Arm(picked)
+}
+
 func (a *application) inspect(ctx context.Context, path string) (scan.Report, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	priority.Lower()
-	before := cgroup.Read()
 	start := time.Now()
+	full := a.trees == nil || a.trees.Due(path, a.cfg.FullScan, start)
+	if err := a.gate.Allow(path, full); err != nil {
+		slog.Info("defer full scan", "path", path)
+		return scan.Report{}, err
+	}
+	before := cgroup.Read()
+	var pausesBefore int64
+	var pausedBefore time.Duration
+	if a.throttle != nil {
+		pausesBefore = a.throttle.Pauses()
+		pausedBefore = a.throttle.Paused()
+	}
+	ctx = scan.WithThrottle(ctx, a.throttle)
 	rep, err := scan.InspectWith(ctx, path, a.trees, start, a.cfg.FullScan)
 	after := cgroup.Read()
 	elapsed := time.Since(start)
 	attrs := []any{
 		"path", path,
+		"full", full,
 		"seconds", elapsed.Seconds(),
 		"entries", rep.Usage.Entries,
+		"throttle_pauses", a.throttlePauses(pausesBefore),
+		"throttle_pause_seconds", a.throttlePaused(pausedBefore).Seconds(),
 		"tracked", rep.Usage.Tracked,
 		"inodes", rep.Usage.Inodes,
 		"bytes", rep.Usage.Bytes,
@@ -225,6 +274,20 @@ func (a *application) inspect(ctx context.Context, path string) (scan.Report, er
 	}
 	cgroup.Release()
 	return rep, err
+}
+
+func (a *application) throttlePauses(before int64) int64 {
+	if a.throttle == nil {
+		return 0
+	}
+	return a.throttle.Pauses() - before
+}
+
+func (a *application) throttlePaused(before time.Duration) time.Duration {
+	if a.throttle == nil {
+		return 0
+	}
+	return a.throttle.Paused() - before
 }
 
 func kubeClient() (kubernetes.Interface, error) {

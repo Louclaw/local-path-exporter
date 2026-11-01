@@ -3,6 +3,7 @@ package exporter
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -56,6 +57,12 @@ func (p *Pacer) interval(entries int64) time.Duration {
 	return d
 }
 
+// Skipping reports whether the volume is still inside its wait.
+func (p *Pacer) Skipping(ns, name string, now time.Time) bool {
+	skip, _, _ := p.skip(ns, name, now)
+	return skip
+}
+
 func (p *Pacer) skip(ns, name string, now time.Time) (bool, int64, time.Duration) {
 	if p == nil || p.base <= 0 || p.perStep <= 0 {
 		return false, 0, 0
@@ -88,10 +95,11 @@ func (p *Pacer) observe(ns, name string, entries int64, now time.Time) {
 }
 
 // RunOnce measures vols with at most parallelism walks at a time.
-// Each walk uses its own timeout. When a walk returns, unused pages are
-// released before the semaphore is freed, so the next volume does not start
-// on top of the previous heap. The cache is updated once, after every walk returns.
-// pace may be nil.
+// Each walk has its own deadline. A full-scan pause extends that deadline,
+// so the timeout does not include voluntary backoff. When a walk returns,
+// unused pages are released before the semaphore is freed, so the next volume
+// does not start on top of the previous heap. The cache is updated once,
+// after every walk returns. pace may be nil.
 func RunOnce(ctx context.Context, vols []mapping.Volume, inspect InspectFunc, cache *metrics.Cache, parallelism int, timeout time.Duration, started time.Time, pace *Pacer) {
 	if parallelism < 1 {
 		parallelism = 1
@@ -126,9 +134,13 @@ func RunOnce(ctx context.Context, vols []mapping.Volume, inspect InspectFunc, ca
 				results[i] = metrics.Result{Namespace: vol.Namespace, PVC: vol.Name, Err: err}
 				return
 			}
-			cctx, cancel := context.WithTimeout(ctx, timeout)
+			cctx, cancel := scan.WithBudget(ctx, timeout)
 			defer cancel()
 			rep, err := inspect(cctx, vol.Path)
+			if errors.Is(err, scan.ErrDeferred) {
+				results[i] = metrics.Result{Namespace: vol.Namespace, PVC: vol.Name, Deferred: true}
+				return
+			}
 			if err != nil {
 				results[i] = metrics.Result{Namespace: vol.Namespace, PVC: vol.Name, Err: err}
 				return

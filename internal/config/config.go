@@ -17,6 +17,11 @@ const (
 	DefaultEntriesPerStep = 50_000
 	DefaultFullScan       = 6 * time.Hour
 	DefaultCacheMaxBytes  = 8 << 20
+	// DefaultThrottleHigh is memory.current, in bytes, above which a full scan pauses.
+	DefaultThrottleHigh = 100 << 20
+	// DefaultThrottleBatch is how many walked entries elapse between those checks.
+	// One batch is about 2–3 MiB of kernel slab, inside the gap from 100 MiB to the 128 MiB limit.
+	DefaultThrottleBatch = 2048
 )
 
 // Config is the process configuration.
@@ -30,6 +35,10 @@ type Config struct {
 	EntriesPerStep int64
 	FullScan       time.Duration
 	CacheMaxBytes  int64
+	// CachePath is an optional file on a writable emptyDir. Empty disables persistence.
+	CachePath     string
+	ThrottleHigh  int64
+	ThrottleBatch int64
 }
 
 // FromEnv loads Config. NODE_NAME is required.
@@ -44,6 +53,9 @@ func FromEnv() (Config, error) {
 		EntriesPerStep: DefaultEntriesPerStep,
 		FullScan:       DefaultFullScan,
 		CacheMaxBytes:  DefaultCacheMaxBytes,
+		CachePath:      os.Getenv("SCAN_CACHE_PATH"),
+		ThrottleHigh:   DefaultThrottleHigh,
+		ThrottleBatch:  DefaultThrottleBatch,
 	}
 	if cfg.NodeName == "" {
 		return Config{}, fmt.Errorf("NODE_NAME is required")
@@ -67,6 +79,12 @@ func FromEnv() (Config, error) {
 	if cfg.CacheMaxBytes, err = int64Env("SCAN_CACHE_MAX_BYTES", DefaultCacheMaxBytes); err != nil {
 		return Config{}, err
 	}
+	if cfg.ThrottleHigh, err = int64Env("SCAN_THROTTLE_HIGH", DefaultThrottleHigh); err != nil {
+		return Config{}, err
+	}
+	if cfg.ThrottleBatch, err = int64Env("SCAN_THROTTLE_BATCH", DefaultThrottleBatch); err != nil {
+		return Config{}, err
+	}
 	if cfg.ScanInterval <= 0 {
 		return Config{}, fmt.Errorf("SCAN_INTERVAL must be positive")
 	}
@@ -84,6 +102,12 @@ func FromEnv() (Config, error) {
 	}
 	if cfg.CacheMaxBytes < 0 {
 		return Config{}, fmt.Errorf("SCAN_CACHE_MAX_BYTES must be >= 0")
+	}
+	if cfg.ThrottleHigh < 0 {
+		return Config{}, fmt.Errorf("SCAN_THROTTLE_HIGH must be >= 0")
+	}
+	if cfg.ThrottleBatch < 0 {
+		return Config{}, fmt.Errorf("SCAN_THROTTLE_BATCH must be >= 0")
 	}
 	return cfg, nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -261,6 +262,88 @@ func TestFullScanInterval(t *testing.T) {
 	if !cache.Due(dir, time.Hour, now.Add(time.Hour)) {
 		t.Fatal("full scan not due at the interval")
 	}
+}
+
+func TestAdaptiveCapKeepsDirectoryHeavyVolumes(t *testing.T) {
+	c := NewTreeCache(DefaultCacheMaxBytes)
+	// About 10MiB each: over the old 8MiB cap, under the 32MiB ceiling together.
+	a := wideTree(20000, 200)
+	b := wideTree(20000, 200)
+	c.commit("/vol-a", a)
+	c.commit("/vol-b", b)
+	if c.Bytes() <= DefaultCacheMaxBytes {
+		t.Fatalf("cache = %d, want more than %d", c.Bytes(), DefaultCacheMaxBytes)
+	}
+	if c.Bytes() > hardCacheMax {
+		t.Fatalf("cache = %d, over hard cap %d", c.Bytes(), hardCacheMax)
+	}
+	if _, ok := c.vols["/vol-a"]; !ok {
+		t.Fatal("first volume was dropped")
+	}
+	if _, ok := c.vols["/vol-b"]; !ok {
+		t.Fatal("second volume was dropped")
+	}
+	if !c.costConsistent("/vol-a") || !c.costConsistent("/vol-b") {
+		t.Fatal("cost drifted")
+	}
+	// Past the hard ceiling the volume is discarded instead of growing without bound.
+	huge := wideTree(200000, 200)
+	c.commit("/too-big", huge)
+	if _, ok := c.vols["/too-big"]; ok {
+		t.Fatalf("volume over the hard cap was kept, bytes=%d", c.Bytes())
+	}
+	if _, ok := c.vols["/vol-a"]; !ok {
+		t.Fatal("dropping the oversized volume removed another one")
+	}
+}
+
+func TestTwoVolumesStayIncrementalUntilFullScan(t *testing.T) {
+	cache := NewTreeCache(DefaultCacheMaxBytes)
+	now := time.Unix(1_700_000_000, 0)
+	var fullEntries int64
+	for _, name := range []string{"immich", "nullclaw"} {
+		dir := t.TempDir()
+		for i := 0; i < 4; i++ {
+			sub := filepath.Join(dir, fmt.Sprintf("d%d", i))
+			if err := os.Mkdir(sub, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(sub, "f"), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := InspectWith(context.Background(), dir, cache, now, 6*time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fullEntries += got.Usage.Entries
+		again, err := InspectWith(context.Background(), dir, cache, now.Add(time.Hour), 6*time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again.Usage.Entries >= got.Usage.Entries || again.Usage.Bytes != got.Usage.Bytes {
+			t.Fatalf("%s rescanned: full %+v again %+v", name, got.Usage, again.Usage)
+		}
+		if cache.Due(dir, 6*time.Hour, now.Add(5*time.Hour)) {
+			t.Fatalf("%s full scan due before 6h", name)
+		}
+	}
+	if fullEntries == 0 || cache.Bytes() == 0 {
+		t.Fatalf("entries=%d cache=%d", fullEntries, cache.Bytes())
+	}
+}
+
+func wideTree(n, nameLen int) *dirNode {
+	root := &dirNode{name: "root"}
+	root.cost = nodeCost(root)
+	pad := strings.Repeat("n", nameLen)
+	root.children = make([]*dirNode, n)
+	for i := 0; i < n; i++ {
+		ch := &dirNode{name: pad}
+		ch.cost = nodeCost(ch)
+		root.children[i] = ch
+	}
+	return root
 }
 
 func sameUsage(ctx context.Context, dir string, cache *TreeCache) error {

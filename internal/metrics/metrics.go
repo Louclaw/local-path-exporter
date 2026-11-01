@@ -26,11 +26,13 @@ type Sample struct {
 }
 
 // Result is the outcome of measuring one volume.
+// Deferred keeps the previous sample and does not count as an error.
 type Result struct {
 	Namespace string
 	PVC       string
 	Sample    Sample
 	Err       error
+	Deferred  bool
 }
 
 // NewSample builds gauges.
@@ -116,9 +118,10 @@ func (c *Cache) Commit(results []Result, durationSec float64) {
 	defer c.mu.Unlock()
 
 	type slot struct {
-		sample Sample
-		ok     bool
-		failed bool
+		sample   Sample
+		ok       bool
+		failed   bool
+		deferred bool
 	}
 	order := make([]string, 0, len(results))
 	slots := map[string]*slot{}
@@ -143,6 +146,14 @@ func (c *Cache) Commit(results []Result, durationSec float64) {
 			}
 			continue
 		}
+		if r.Deferred {
+			s.deferred = true
+			if s.sample.Namespace == "" {
+				s.sample.Namespace = r.Namespace
+				s.sample.PVC = r.PVC
+			}
+			continue
+		}
 		s.sample = r.Sample
 		s.ok = true
 	}
@@ -155,6 +166,12 @@ func (c *Cache) Commit(results []Result, durationSec float64) {
 		if s.ok {
 			next[k] = s.sample
 			successes++
+			continue
+		}
+		if s.deferred && !s.failed {
+			if old, ok := c.samples[k]; ok {
+				next[k] = old
+			}
 			continue
 		}
 		failures++
