@@ -11,23 +11,30 @@ const (
 	DefaultThrottleHigh = 100 << 20
 	// DefaultThrottleBatch is how many walked entries elapse between checks.
 	DefaultThrottleBatch = 8192
-	minThrottleSleep     = 20 * time.Millisecond
-	maxThrottleSleep     = 200 * time.Millisecond
-	maxThrottlePause     = 500 * time.Millisecond
+	// DefaultMaxPerSec is a hard cap on walked entries, independent of memory.current.
+	// The memory threshold does not fire while the cgroup is still under it, and a
+	// burst there is what filled hel1 before reclaim could run.
+	DefaultMaxPerSec = 4000
+	minThrottleSleep = 20 * time.Millisecond
+	maxThrottleSleep = 200 * time.Millisecond
+	maxThrottlePause = 500 * time.Millisecond
 )
 
-// Throttle slows a full scan while memory.current stays above High so memcg
-// reclaim can finish. memory.high is max on a normal kubelet cgroup, so reclaim
-// runs only at memory.max; the pause keeps new dentries from outrunning it.
+// Throttle slows every walk. Two independent brakes: a hard entries/sec cap,
+// and a backoff while memory.current stays above High. memory.high is max on
+// a normal kubelet cgroup, so the memory backoff only helps once the walk is
+// already near memory.max.
 type Throttle struct {
-	High  uint64
-	Batch int64
+	High      uint64
+	Batch     int64
+	MaxPerSec int64
 
 	current func() (uint64, bool)
 
-	pauses atomic.Int64
-	paused atomic.Int64 // nanoseconds, process lifetime
-	last   atomic.Int64 // nanoseconds in the most recent Check burst
+	pauses    atomic.Int64
+	paused    atomic.Int64 // nanoseconds, process lifetime
+	last      atomic.Int64 // nanoseconds in the most recent Check burst
+	rateStart atomic.Int64 // unix nanoseconds of the first paced entry
 }
 
 // NewThrottle returns a throttler. high or batch <= 0 disables it.
@@ -67,10 +74,21 @@ func (t *Throttle) LastPaused() time.Duration {
 	return time.Duration(t.last.Load())
 }
 
-// Check sleeps, with capped exponential backoff, while memory.current is above High.
-// extend receives each sleep so the scan timeout does not count it.
+// Check applies the entries/sec cap and, when memory.current is above High,
+// a capped backoff. extend receives each sleep so the scan timeout does not count it.
 func (t *Throttle) Check(ctx context.Context, entries int64, extend func(time.Duration)) {
-	if t == nil || t.High == 0 || t.Batch <= 0 || entries <= 0 || entries%t.Batch != 0 {
+	if t == nil || entries <= 0 {
+		return
+	}
+	step := t.Batch
+	if step <= 0 {
+		step = 1024
+	}
+	if entries%step != 0 {
+		return
+	}
+	t.limitRate(ctx, entries, extend)
+	if t.High == 0 || t.Batch <= 0 {
 		return
 	}
 	curFn := t.current
@@ -111,6 +129,48 @@ func (t *Throttle) Check(ctx context.Context, entries int64, extend func(time.Du
 		if delay < maxThrottleSleep {
 			delay *= 2
 		}
+	}
+	t.finish(waited)
+}
+
+// limitRate sleeps so the walk cannot exceed MaxPerSec, even when
+// memory.current is still under the threshold.
+func (t *Throttle) limitRate(ctx context.Context, entries int64, extend func(time.Duration)) {
+	if t.MaxPerSec <= 0 {
+		return
+	}
+	now := time.Now()
+	start := t.rateStart.Load()
+	if start == 0 {
+		t.rateStart.CompareAndSwap(0, now.UnixNano())
+		start = t.rateStart.Load()
+	}
+	var waited time.Duration
+	for {
+		elapsed := time.Since(time.Unix(0, start))
+		want := time.Duration(entries) * time.Second / time.Duration(t.MaxPerSec)
+		if want <= elapsed {
+			break
+		}
+		d := want - elapsed
+		// Sleep in short steps so a cancelled scan is not stuck, without
+		// capping the total wait: the cap is the whole point of the rate.
+		if d > time.Second {
+			d = time.Second
+		}
+		if extend != nil {
+			extend(d)
+		}
+		t.pauses.Add(1)
+		timer := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			t.finish(waited)
+			return
+		case <-timer.C:
+		}
+		waited += d
 	}
 	t.finish(waited)
 }

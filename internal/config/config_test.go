@@ -32,7 +32,7 @@ func TestFromEnvDefaults(t *testing.T) {
 	if cfg.EntriesPerStep != DefaultEntriesPerStep || cfg.FullScan != DefaultFullScan || cfg.CacheMaxBytes != DefaultCacheMaxBytes {
 		t.Fatalf("unexpected incremental defaults: %+v", cfg)
 	}
-	if cfg.CachePath != "" || cfg.ThrottleHigh != DefaultThrottleHigh || cfg.ThrottleBatch != DefaultThrottleBatch {
+	if cfg.CachePath != "" || cfg.ThrottleHigh != DefaultThrottleHigh || cfg.ThrottleBatch != DefaultThrottleBatch || cfg.MaxPerSec != DefaultMaxPerSec {
 		t.Fatalf("unexpected throttle defaults: %+v", cfg)
 	}
 }
@@ -50,6 +50,7 @@ func TestFromEnvOverrides(t *testing.T) {
 	t.Setenv("SCAN_CACHE_PATH", "/var/lib/local-path-exporter/cache.v1")
 	t.Setenv("SCAN_THROTTLE_HIGH", "0")
 	t.Setenv("SCAN_THROTTLE_BATCH", "512")
+	t.Setenv("SCAN_MAX_ENTRIES_PER_SEC", "1000")
 
 	cfg, err := FromEnv()
 	if err != nil {
@@ -58,7 +59,7 @@ func TestFromEnvOverrides(t *testing.T) {
 	if cfg.StoragePath != "/data" || cfg.MetricsAddr != ":8080" || cfg.ScanInterval != 30*time.Second || cfg.ScanTimeout != time.Minute || cfg.Parallelism != 4 || cfg.EntriesPerStep != 1000 || cfg.FullScan != 12*time.Hour || cfg.CacheMaxBytes != 4096 {
 		t.Fatalf("unexpected override: %+v", cfg)
 	}
-	if cfg.CachePath != "/var/lib/local-path-exporter/cache.v1" || cfg.ThrottleHigh != 0 || cfg.ThrottleBatch != 512 {
+	if cfg.CachePath != "/var/lib/local-path-exporter/cache.v1" || cfg.ThrottleHigh != 0 || cfg.ThrottleBatch != 512 || cfg.MaxPerSec != 1000 {
 		t.Fatalf("unexpected throttle override: %+v", cfg)
 	}
 }

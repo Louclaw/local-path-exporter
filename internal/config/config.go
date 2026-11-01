@@ -22,6 +22,9 @@ const (
 	// DefaultThrottleBatch is how many walked entries elapse between those checks.
 	// One batch is about 2–3 MiB of kernel slab, inside the gap from 100 MiB to the 128 MiB limit.
 	DefaultThrottleBatch = 2048
+	// DefaultMaxPerSec caps every walk, including the incremental ones that
+	// stay under the memory threshold. 0 disables the cap.
+	DefaultMaxPerSec int64 = 4000
 )
 
 // Config is the process configuration.
@@ -39,6 +42,7 @@ type Config struct {
 	CachePath     string
 	ThrottleHigh  int64
 	ThrottleBatch int64
+	MaxPerSec     int64
 }
 
 // FromEnv loads Config. NODE_NAME is required.
@@ -56,6 +60,7 @@ func FromEnv() (Config, error) {
 		CachePath:      os.Getenv("SCAN_CACHE_PATH"),
 		ThrottleHigh:   DefaultThrottleHigh,
 		ThrottleBatch:  DefaultThrottleBatch,
+		MaxPerSec:      DefaultMaxPerSec,
 	}
 	if cfg.NodeName == "" {
 		return Config{}, fmt.Errorf("NODE_NAME is required")
@@ -85,6 +90,9 @@ func FromEnv() (Config, error) {
 	if cfg.ThrottleBatch, err = int64Env("SCAN_THROTTLE_BATCH", DefaultThrottleBatch); err != nil {
 		return Config{}, err
 	}
+	if cfg.MaxPerSec, err = int64Env("SCAN_MAX_ENTRIES_PER_SEC", DefaultMaxPerSec); err != nil {
+		return Config{}, err
+	}
 	if cfg.ScanInterval <= 0 {
 		return Config{}, fmt.Errorf("SCAN_INTERVAL must be positive")
 	}
@@ -108,6 +116,9 @@ func FromEnv() (Config, error) {
 	}
 	if cfg.ThrottleBatch < 0 {
 		return Config{}, fmt.Errorf("SCAN_THROTTLE_BATCH must be >= 0")
+	}
+	if cfg.MaxPerSec < 0 {
+		return Config{}, fmt.Errorf("SCAN_MAX_ENTRIES_PER_SEC must be >= 0")
 	}
 	return cfg, nil
 }

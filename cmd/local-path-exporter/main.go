@@ -50,6 +50,7 @@ func main() {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(metrics.NewCollector(store))
 	throttle := cgroup.NewThrottle(uint64(cfg.ThrottleHigh), cfg.ThrottleBatch)
+	throttle.MaxPerSec = cfg.MaxPerSec
 	reg.MustRegister(cgroup.NewCollector(throttle))
 
 	var ready atomic.Bool
